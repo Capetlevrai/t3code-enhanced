@@ -12,11 +12,15 @@ foreach ($key in $keys) {
     }
 }
 
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "T3CodeBackground" -ErrorAction SilentlyContinue
+
 $installDir = Join-Path $env:LOCALAPPDATA "t3code-context-menu"
 if (Test-Path -LiteralPath $installDir) {
-    Remove-Item -LiteralPath $installDir -Recurse -Force
+    try {
+        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction Stop
+    } catch {
+        Write-Warning "Impossible de supprimer completement $installDir (fichier verrouille) : $($_.Exception.Message)"
+    }
 }
-
-Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "T3CodeBackground" -ErrorAction SilentlyContinue
 
 Write-Host "Raccourci T3 Code (et autostart eventuel) desinstalle proprement." -ForegroundColor Yellow

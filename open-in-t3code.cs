@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -14,6 +15,10 @@ using System.Windows.Forms;
 // instead of spawning Electron with ELECTRON_RUN_AS_NODE=1 + server.asar (which takes 5-20s).
 static class Program
 {
+    [DllImport("user32.dll")]
+    private static extern bool AllowSetForegroundWindow(int dwProcessId);
+    private const int ASFW_ANY = -1;
+
     private static readonly Stopwatch Sw = Stopwatch.StartNew();
     private static string _logPath;
 
@@ -67,7 +72,8 @@ static class Program
         }
         else
         {
-            t3Home = Path.GetFullPath(t3Home.Trim());
+            try { t3Home = Path.GetFullPath(t3Home.Trim().Trim('"')); }
+            catch { t3Home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".t3"); }
         }
         string stateDir = Path.GetFullPath(Path.Combine(t3Home, "userdata"));
         string devStateDir = Path.GetFullPath(Path.Combine(t3Home, "dev"));
@@ -107,7 +113,10 @@ static class Program
         Process launchedProc = null;
         int launchCount = 0;
 
-        EnsureT3CodeStarted(mutexName, exePath, installDir, exeProcName, primaryPipePath, devPipePath, ref launchedProc, ref launchCount);
+        if (!EnsureT3CodeStarted(mutexName, exePath, installDir, exeProcName, primaryPipePath, devPipePath, ref launchedProc, ref launchCount))
+        {
+            return 1;
+        }
 
         // Step 3: Poll for the named pipe every 100 ms, wait for local backend HTTP readiness
         // (reading dynamic port from server-runtime.json), then send IPC within overall deadline.
@@ -126,8 +135,9 @@ static class Program
                     int remainingForBackend = (int)Math.Max(0, Math.Min(12000, maxWaitMs - Sw.ElapsedMilliseconds - 5000));
                     if (remainingForBackend > 0)
                     {
+                        string activeStateDir = (readyPipe == devPipe) ? devStateDir : stateDir;
                         Log("Step 3: Pipe appeared, waiting for local backend readiness");
-                        WaitForLocalBackend(stateDir, remainingForBackend);
+                        WaitForLocalBackend(activeStateDir, remainingForBackend);
                     }
                     waitedForBackend = true;
                 }
@@ -151,12 +161,15 @@ static class Program
             {
                 // Guard against both: (a) our launched process exiting on second-instance race,
                 // and (b) a previously observed instance exiting after we skipped launching.
-                bool noProcessesLeft = Process.GetProcessesByName(exeProcName).Length == 0;
+                bool noProcessesLeft = CountCurrentSessionProcesses(exeProcName) == 0;
                 bool launchedExited = (launchedProc != null && launchedProc.HasExited);
                 if ((noProcessesLeft || launchedExited) && launchCount < 3)
                 {
                     Log("Step 3: No active pipe and instance absent/exited (noProcs=" + noProcessesLeft + ", launchedExited=" + launchedExited + "); ensuring launch");
-                    EnsureT3CodeStarted(mutexName, exePath, installDir, exeProcName, primaryPipePath, devPipePath, ref launchedProc, ref launchCount);
+                    if (!EnsureT3CodeStarted(mutexName, exePath, installDir, exeProcName, primaryPipePath, devPipePath, ref launchedProc, ref launchCount))
+                    {
+                        return 1;
+                    }
                 }
                 Thread.Sleep(100);
             }
@@ -206,7 +219,23 @@ static class Program
         return p;
     }
 
-    private static void EnsureT3CodeStarted(
+    private static int CountCurrentSessionProcesses(string procName)
+    {
+        int mySession = Process.GetCurrentProcess().SessionId;
+        int count = 0;
+        foreach (var p in Process.GetProcessesByName(procName))
+        {
+            try
+            {
+                if (p.SessionId == mySession) count++;
+            }
+            catch { }
+            finally { p.Dispose(); }
+        }
+        return count;
+    }
+
+    private static bool EnsureT3CodeStarted(
         string mutexName,
         string exePath,
         string installDir,
@@ -225,13 +254,19 @@ static class Program
                 try { acquired = mutex.WaitOne(12000); }
                 catch (AbandonedMutexException) { acquired = true; }
 
+                if (!acquired)
+                {
+                    Log("Step 2: Another launcher holds startup mutex; deferring to poll loop");
+                    return true;
+                }
+
                 if (File.Exists(primaryPipePath) || File.Exists(devPipePath))
                 {
-                    return;
+                    return true;
                 }
 
                 // Wait for any shutting-down T3 Code processes (closeScope takes ~5s) to release SingleInstanceLock
-                if (Process.GetProcessesByName(exeProcName).Length > 0)
+                if (CountCurrentSessionProcesses(exeProcName) > 0)
                 {
                     Log("Step 2: Pipe absent while " + exeProcName + " is running (shutting down or booting); waiting...");
                     var waitExitSw = Stopwatch.StartNew();
@@ -240,9 +275,9 @@ static class Program
                         if (File.Exists(primaryPipePath) || File.Exists(devPipePath))
                         {
                             Log("Step 2: Pipe appeared after " + waitExitSw.ElapsedMilliseconds + "ms");
-                            return;
+                            return true;
                         }
-                        if (Process.GetProcessesByName(exeProcName).Length == 0)
+                        if (CountCurrentSessionProcesses(exeProcName) == 0)
                         {
                             Log("Step 2: Previous instance exited after " + waitExitSw.ElapsedMilliseconds + "ms");
                             break;
@@ -253,9 +288,11 @@ static class Program
 
                 if (!File.Exists(primaryPipePath) && !File.Exists(devPipePath) && launchCount < 3)
                 {
+                    launchCount++;
                     launchedProc = LaunchT3Code(exePath, installDir);
-                    if (launchedProc != null) launchCount++;
+                    if (launchedProc == null) return false;
                 }
+                return true;
             }
             finally
             {
@@ -383,6 +420,7 @@ static class Program
         const int timeoutMs = IpcReadTimeoutMs;
         try
         {
+            try { AllowSetForegroundWindow(ASFW_ANY); } catch { }
             using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
             {
                 client.Connect(2000);
@@ -408,7 +446,7 @@ static class Program
                     if (!readTask.Wait(timeoutMs))
                     {
                         error = "read timeout (" + timeoutMs + "ms)";
-                        return IpcResult.Retry;
+                        return IpcResult.Fatal;
                     }
                     string line = readTask.Result;
                     if (string.IsNullOrEmpty(line))
@@ -456,12 +494,11 @@ static class Program
             // Window not ready yet, local environment still connecting, app restarting: retry.
             case "renderer-unavailable":
             case "environment-unavailable":
-            case "request-timeout":
             case "internal-error":
             case "":
                 return IpcResult.Retry;
-            // invalid-request, platform-mismatch, project-create-failed, thread-open-failed:
-            // retrying cannot help and could duplicate work.
+            // request-timeout, invalid-request, platform-mismatch, project-create-failed, thread-open-failed:
+            // retrying cannot help and could duplicate work if the renderer is still processing.
             default:
                 return IpcResult.Fatal;
         }

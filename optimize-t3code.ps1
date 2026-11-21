@@ -19,7 +19,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$t3Home = if ($env:T3CODE_HOME) { [System.IO.Path]::GetFullPath($env:T3CODE_HOME.Trim()) } else { Join-Path $env:USERPROFILE ".t3" }
+$t3Home = if (-not [string]::IsNullOrWhiteSpace($env:T3CODE_HOME)) { [System.IO.Path]::GetFullPath($env:T3CODE_HOME.Trim().Trim('"')) } else { Join-Path $env:USERPROFILE ".t3" }
 $userData = Join-Path $t3Home "userdata"
 $settingsPath = Join-Path $userData "settings.json"
 $logsDir = Join-Path $userData "logs"
@@ -40,6 +40,8 @@ if ($EnableAutostart -or $DisableAutostart) {
         if ($exePath) {
             Set-ItemProperty -Path $runKey -Name $runName -Value "`"$exePath`""
             Write-Host "[OK] Demarrage automatique active (HKCU\...\Run\$runName)." -ForegroundColor Green
+        } else {
+            Write-Warning "T3 Code est introuvable dans $t3Dir ; demarrage automatique non active."
         }
     }
     if ($DisableAutostart) {
@@ -54,6 +56,7 @@ $running = @(Get-Process | Where-Object { $_.ProcessName -match '^T3 Code' })
 # 1. Disable provider update checks in settings.json (only when T3 Code is closed, UTF-8 no BOM, atomic)
 if (Test-Path -LiteralPath $settingsPath) {
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $origWriteTime = (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc
     $raw = [System.IO.File]::ReadAllText($settingsPath, $utf8NoBom)
     $json = $raw | ConvertFrom-Json
     $alreadyFalse = ($null -ne $json.PSObject.Properties["enableProviderUpdateChecks"]) -and ($json.enableProviderUpdateChecks -eq $false)
@@ -63,7 +66,6 @@ if (Test-Path -LiteralPath $settingsPath) {
     } elseif ($running.Count -gt 0) {
         Write-Host "[SKIP] settings.json non modifie (fermez T3 Code pour eviter tout ecrasement concurrent)." -ForegroundColor Yellow
     } else {
-        $origWriteTime = (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc
         if ($null -eq $json.PSObject.Properties["enableProviderUpdateChecks"]) {
             $json | Add-Member -NotePropertyName "enableProviderUpdateChecks" -NotePropertyValue $false
         } else {
@@ -97,6 +99,7 @@ if (Test-Path -LiteralPath $settingsPath) {
 if (Test-Path -LiteralPath $logsDir) {
     $rotated = @(Get-ChildItem -LiteralPath $logsDir -File | Where-Object { $_.Name -match '\.ndjson\.([1-9]|10)$' })
     $deletedCount = 0
+    $lockedCount = 0
     $freedBytes = 0L
     foreach ($f in $rotated) {
         $len = $f.Length
@@ -105,11 +108,14 @@ if (Test-Path -LiteralPath $logsDir) {
             $deletedCount++
             $freedBytes += $len
         } catch {
-            # File locked or already gone
+            $lockedCount++
         }
     }
     if ($deletedCount -gt 0) {
-        Write-Host ("[OK] {0} fichiers de logs en rotation supprimes ({1:N1} Mo liberes)" -f $deletedCount, ($freedBytes / 1MB)) -ForegroundColor Green
+        $extra = if ($lockedCount -gt 0) { " ($lockedCount verrouilles ignores)" } else { "" }
+        Write-Host ("[OK] {0} fichiers de logs en rotation supprimes ({1:N1} Mo liberes){2}" -f $deletedCount, ($freedBytes / 1MB), $extra) -ForegroundColor Green
+    } elseif ($lockedCount -gt 0) {
+        Write-Host ("[WARN] {0} fichiers de logs en rotation verrouilles (aucun supprime)." -f $lockedCount) -ForegroundColor Yellow
     } else {
         Write-Host "[OK] Aucun fichier de log en rotation (.1..10) a nettoyer." -ForegroundColor Cyan
     }
@@ -138,11 +144,14 @@ try { db.exec('PRAGMA optimize;'); } catch (e) { optOk = false; }
 db.close();
 console.log(JSON.stringify({ busy: cp ? cp.busy : -1, log: cp ? cp.log : -1, checkpointed: cp ? cp.checkpointed : -1, optOk }));
 "@ | Set-Content -LiteralPath $tmpJs -Encoding ASCII
+        $prevEap = $ErrorActionPreference
         try {
             $env:ELECTRON_RUN_AS_NODE = "1"
+            $ErrorActionPreference = "Continue"
             $outJson = (& $exePath $tmpJs $dbPath 2>&1 | Out-String).Trim()
             $sqliteRc = $LASTEXITCODE
         } finally {
+            $ErrorActionPreference = $prevEap
             if ($null -eq $prevElectronAsNode) {
                 Remove-Item Env:ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
             } else {
@@ -157,6 +166,8 @@ console.log(JSON.stringify({ busy: cp ? cp.busy : -1, log: cp ? cp.log : -1, che
                 $res = $outJson | ConvertFrom-Json
                 if ($res.busy -ne 0) {
                     Write-Host "[WARN] SQLite WAL checkpoint differe (base verrouillee, busy=$($res.busy)); PRAGMA optimize=$($res.optOk)." -ForegroundColor Yellow
+                } elseif (-not $res.optOk) {
+                    Write-Host ("[WARN] SQLite WAL checkpoint OK ({0:N2} Mo -> {1:N2} Mo) mais PRAGMA optimize a echoue." -f $beforeMb, $afterMb) -ForegroundColor Yellow
                 } else {
                     Write-Host ("[OK] SQLite checkpoint + optimize : {0:N2} Mo -> {1:N2} Mo" -f $beforeMb, $afterMb) -ForegroundColor Green
                 }
