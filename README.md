@@ -1,109 +1,107 @@
 # T3 Code Enhanced (Windows)
 
-Outils, intégration Explorateur Windows ultra-rapide et optimisations de démarrage pour **T3 Code** (`pingdotgg/t3code`) sur Windows.
+Ultra-fast Windows Explorer context menu integration ("Open in T3 Code") and startup optimizations for **T3 Code** (`pingdotgg/t3code`) on Windows.
 
 ---
 
-## Benchmarks réels (Avant / Après)
+## Real-World Benchmarks (Before / After)
 
-Mesures relevées sur Windows (`%LOCALAPPDATA%\t3code-context-menu\last-run.log`, `desktop.trace.ndjson`, `server.trace.ndjson`) :
+Measured on Windows from `%LOCALAPPDATA%\t3code-context-menu\last-run.log`, `desktop.trace.ndjson`, and `server.trace.ndjson`:
 
-| Scénario / Étape | Avant (VBS + `t3 app`) | Après (`open-in-t3code.exe` + optimisations) | Gain |
+| Scenario / Step | Before (VBS + `t3 app`) | After (`open-in-t3code.exe` + optimizations) | Speedup |
 | --- | --- | --- | --- |
-| **Warm start** (T3 Code ouvert → clic droit Explorateur) | **12,53 s** | **0,07 s** (60–76 ms, 33 ms interne) | **~170× plus rapide** |
-| **Cold start complet** (T3 Code fermé → dossier ouvert) | **36–42 s** | **5,44 s** (6,27 s wall time, 1er essai IPC) | **~6,6–7,7× plus rapide** |
-| Détection app fermée (Étape 1) | **~21 000 ms** (timeout `CLI_RESPONSE_TIMEOUT_MS`) | **14–33 ms** (`File.Exists` sur named pipe) | **~630× plus rapide** |
-| Apparition du named pipe + backend local prêt | **~15–22 s** | **~4,22 s** (pipe `+0,91 s`, HTTP 200 `+4,22 s`) | **~3,5–5× plus rapide** |
-| Logs `%USERPROFILE%\.t3\userdata\logs` | **131,9 Mo** (13 fichiers en rotation) | **~10 Mo** (**129,3 Mo** libérés) | **-92 %** |
+| **Warm start** (T3 Code open → Explorer right-click) | **12.53 s** | **0.07 s** (60–93 ms wall, 33 ms internal) | **~170× faster** |
+| **Full cold start** (T3 Code closed → folder opened) | **36–42 s** | **4.72–5.44 s** (1st IPC attempt) | **~7–8× faster** |
+| Closed-app detection (Step 1) | **~21,000 ms** (`CLI_RESPONSE_TIMEOUT_MS`) | **15–33 ms** (`File.Exists` on named pipe) | **~630× faster** |
+| Control pipe + local backend ready | **~15–22 s** | **~3.10–4.22 s** (pipe `+0.68 s`, HTTP 200 `+3.10 s`) | **~5× faster** |
+| Trace logs (`%USERPROFILE%\.t3\userdata\logs`) | **131.9 MB** (13 rotated files) | **~10 MB** (**129.3 MB** freed) | **-92%** |
 
 ---
 
-## 1. Menu contextuel Windows (« Ouvrir dans T3 Code »)
+## 1. Windows Explorer Context Menu ("Ouvrir dans T3 Code" / Open in T3 Code)
 
-Ajoute une entrée **Ouvrir dans T3 Code** (avec l'icône T3 Code) dans le clic droit de l'Explorateur Windows :
-- Clic droit **sur un dossier** (`HKCU\Software\Classes\Directory\shell\T3CodeOpen`)
-- Clic droit **dans le vide d'un dossier** (`HKCU\Software\Classes\Directory\Background\shell\T3CodeOpen`)
-- Clic droit **sur un lecteur** (`HKCU\Software\Classes\Drive\shell\T3CodeOpen`)
+Adds a right-click menu entry (with the T3 Code icon) across Windows Explorer:
+- Right-click **on a folder** (`HKCU\Software\Classes\Directory\shell\T3CodeOpen`)
+- Right-click **inside a folder background** (`HKCU\Software\Classes\Directory\Background\shell\T3CodeOpen`)
+- Right-click **on a drive** (`HKCU\Software\Classes\Drive\shell\T3CodeOpen`)
 
-> **Sans droits administrateur** (registre utilisateur `HKCU`). Sur Windows 11, l'entrée apparaît dans *Afficher plus d'options* (ou `Maj + Clic droit`).
+> **No administrator privileges required** (per-user `HKCU` registry). On Windows 11, the entry appears under *Show more options* (or `Shift + Right-click`).
 
-### Architecture ultra-rapide (IPC direct sur named pipe)
-- **Pourquoi l'ancienne méthode était lente :** lancer `ELECTRON_RUN_AS_NODE=1 "T3 Code (Beta).exe" "...\bin.mjs" app "<dossier>"` démarre le binaire Electron (~200 Mo) + charge `server.asar` à chaque clic droit (5 à 15 s même à chaud, et ~21 s de timeout à froid).
-- **Nouveau lanceur natif [`open-in-t3code.cs`](open-in-t3code.cs)** compilé automatiquement en `open-in-t3code.exe` (~8 Ko, WinExe sans fenêtre console) par [`install.ps1`](install.ps1) via le compilateur `.NET Framework 4` intégré à Windows (`csc.exe`) :
-  - Calcule le nom exact du named pipe de contrôle T3 Code : `\\.\pipe\t3code-app-<sha256_24(stateDir)>` (compatible `T3CODE_HOME` + fallback `dev`).
-  - **À chaud (~70 ms) :** détecte le pipe en `< 20 ms` et envoie directement la requête JSON officielle `open-workspace` (protocole v1) via `NamedPipeClientStream`.
-  - **À froid (~5,4 s) :** détecte l'absence du pipe en `~15–30 ms`, lance immédiatement `T3 Code (Beta).exe` (sans `ELECTRON_RUN_AS_NODE`), attend le pipe (`~0,9 s`) puis la disponibilité HTTP du backend local (`http://127.0.0.1:3773/.well-known/t3/environment`, `~3,3 s`) avant d'envoyer l'IPC au premier essai sans timeout interne.
-  - Journalise chaque étape à la milliseconde dans `%LOCALAPPDATA%\t3code-context-menu\last-run.log`.
-- **Fallback [`open-in-t3code.vbs`](open-in-t3code.vbs)** également optimisé (détection `fso.FileExists` du pipe en `0 ms` injectée par `install.ps1`) si `csc.exe` n'est pas présent.
+### How It Works (Direct Named-Pipe IPC)
+- **Why the standard CLI wrapper was slow:** invoking `ELECTRON_RUN_AS_NODE=1 "T3 Code (Beta).exe" "...\bin.mjs" app "<folder>"` spawns the ~200 MB Electron binary and loads `server.asar` on every right-click (5–15 s even on a warm start, and ~21 s waiting on timeout during a cold start).
+- **Lightweight native launcher ([`open-in-t3code.cs`](open-in-t3code.cs)):** compiled automatically into an ~8 KB console-free WinExe (`open-in-t3code.exe`) by [`install.ps1`](install.ps1) using Windows' built-in `.NET Framework 4` compiler (`csc.exe`) — zero external dependencies:
+  - Computes T3 Code's exact control named pipe: `\\.\pipe\t3code-app-<sha256_24(stateDir)>` (respects `T3CODE_HOME` with `dev` fallback).
+  - **Warm start (~70 ms):** detects the pipe in `< 20 ms` and sends the official JSON v1 `open-workspace` request directly over `NamedPipeClientStream`.
+  - **Cold start (~4.7 s):** detects the missing pipe in `~15 ms`, handles Electron's `SingleInstanceLock` shutdown grace window cleanly if you just closed T3 Code, launches `T3 Code (Beta).exe` without `ELECTRON_RUN_AS_NODE`, waits for the pipe (`~0.7 s`) and local backend HTTP readiness (`http://127.0.0.1:3773/.well-known/t3/environment`, `~2.4–3.3 s`), then sends the IPC request on the first try.
+  - Logs millisecond-level timings to `%LOCALAPPDATA%\t3code-context-menu\last-run.log`.
+- **Fallback ([`open-in-t3code.vbs`](open-in-t3code.vbs)):** also optimized with `0 ms` pipe detection injected by `install.ps1` if `csc.exe` is unavailable.
 
-### Installation / Désinstallation
+### Install / Uninstall
 
 ```powershell
-# Installer (compile open-in-t3code.exe + configure le registre HKCU)
+# Install (compiles open-in-t3code.exe + registers HKCU context menu)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
-# Désinstaller proprement (registre + dossier AppData)
+# Clean uninstall (removes registry keys + AppData folder)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\uninstall.ps1
 ```
 
 ---
 
-## 2. Optimisation de T3 Code (`optimize-t3code.ps1`)
+## 2. T3 Code Startup & Maintenance Optimizer (`optimize-t3code.ps1`)
 
-Le script [`optimize-t3code.ps1`](optimize-t3code.ps1) applique des optimisations sûres sans supprimer aucune donnée utilisateur :
-1. **`enableProviderUpdateChecks: false`** dans `%USERPROFILE%\.t3\userdata\settings.json` (supprime les vérifications réseau de mises à jour providers au boot).
-2. **Purge des logs en rotation** (`*.ndjson.1` .. `.10` dans `%USERPROFILE%\.t3\userdata\logs`) tout en conservant les traces actives.
-3. **Maintenance SQLite** (`PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;` sur `statev2.sqlite` lorsque T3 Code est fermé).
-4. **Mode instantané optionnel (`-EnableAutostart`)** : ajoute T3 Code au démarrage de session Windows (`HKCU\...\Run`, sans droits admin) pour bénéficier d'ouvertures à **~70 ms** en permanence.
+[`optimize-t3code.ps1`](optimize-t3code.ps1) applies safe local optimizations without deleting any user data:
+1. Sets **`enableProviderUpdateChecks: false`** in `%USERPROFILE%\.t3\userdata\settings.json` (avoids network update checks for providers at boot).
+2. **Purges old rotated trace logs** (`*.ndjson.1` .. `.10` in `%USERPROFILE%\.t3\userdata\logs`) while keeping active trace files intact.
+3. **Runs SQLite maintenance** (`PRAGMA wal_checkpoint(TRUNCATE); PRAGMA optimize;` on `statev2.sqlite` when T3 Code is closed).
+4. **Optional instant-open mode (`-EnableAutostart`):** registers T3 Code in `HKCU\...\Run` (no admin required) so every Explorer right-click opens in **~70 ms** all day.
 
 ```powershell
-# Appliquer les optimisations locales (settings + logs + SQLite si T3 Code est fermé)
+# Apply local optimizations (settings + log rotation cleanup + SQLite when T3 Code is closed)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\optimize-t3code.ps1
 
-# Optionnel : activer / désactiver le démarrage automatique avec Windows
+# Optional: enable / disable launch on Windows sign-in
 powershell -NoProfile -ExecutionPolicy Bypass -File .\optimize-t3code.ps1 -EnableAutostart
 powershell -NoProfile -ExecutionPolicy Bypass -File .\optimize-t3code.ps1 -DisableAutostart
 ```
 
 ---
 
-## 3. Optimisation Windows Defender
+## 3. Windows Defender Exclusions
 
-Sur Windows, l'analyse en temps réel de Windows Defender sur les binaires Electron (`T3 Code (Beta).exe`, `app.asar`, `server.asar`) et les sous-processus CLI (`codex`, `claude`, `git`) ralentit fortement le démarrage à froid.
+On Windows, real-time scanning of Electron binaries (`T3 Code (Beta).exe`, `app.asar`, `server.asar`) and spawned CLI tools (`codex`, `claude`, `git`) is a major cold-start bottleneck.
 
 ```powershell
-# Ajouter les exclusions (%LOCALAPPDATA%\Programs\t3code et %USERPROFILE%\.t3) — demande l'élévation UAC
+# Add exclusions (%LOCALAPPDATA%\Programs\t3code and %USERPROFILE%\.t3) — prompts for UAC elevation
 powershell -NoProfile -ExecutionPolicy Bypass -File .\add-defender-exclusions.ps1
 
-# Retirer les exclusions
+# Remove exclusions
 powershell -NoProfile -ExecutionPolicy Bypass -File .\remove-defender-exclusions.ps1
 ```
 
-> **Note :** La lecture des exclusions actives via `Get-MpPreference` nécessite une console Administrateur (`Must be an administrator to view exclusions`).
-
 ---
 
-## 4. Analyse détaillée des traces de boot (`desktop.trace.ndjson` & `server.trace.ndjson`)
+## 4. Cold-Start Trace Breakdown (`desktop.trace.ndjson` & `server.trace.ndjson`)
 
-Principaux postes de temps identifiés lors d'un démarrage à froid de `T3 Code (Beta).exe` :
+Key spans measured during a cold start of `T3 Code (Beta).exe`:
 
-| Composant / Span | Durée mesurée | Remarque |
+| Component / Span | Measured Duration | Notes |
 | --- | --- | --- |
-| Spawn Node + chargement `server.asar` | **~1,47 s** | Temps entre démarrage Electron et premier span serveur |
-| `desktop.shellEnvironment.refresh` (Windows) | **1,07 s** | Exécuté en parallèle du démarrage backend |
-| `makeCodexInstallation` (`CodexInstallation.resolveLocal`) | **0,78 s** | Sonde CLI `codex` au démarrage serveur |
-| `VcsProcess.spawn` (`gh`) | **0,18 s** | Sonde CLI GitHub |
-| `Sqlite.setup` (`statev2.sqlite`, 65 Mo) | **7,7 ms** | Très rapide au boot (compaction officielle disponible via `t3 doctor`) |
-| Sondes post-boot en parallèle (non bloquantes pour l'ouverture) | **1,1–1,7 s** | `withCodexAppServerClient` (`1,46 s`), `runClaudeCommand` (`1,19 s`), `runGrokCliCommand` (`1,15 s`), `tailscale` (`1,04 s`), `git` repo identity (`1,1 s`) |
+| Node spawn + `server.asar` load | **~1.47 s** | Gap between Electron launch and first server span |
+| `desktop.shellEnvironment.refresh` (Windows) | **1.07 s** | Runs in parallel with backend startup |
+| `makeCodexInstallation` (`CodexInstallation.resolveLocal`) | **0.78 s** | Local `codex` CLI probe during server boot |
+| `VcsProcess.spawn` (`gh`) | **0.18 s** | GitHub CLI probe |
+| `Sqlite.setup` (`statev2.sqlite`, 65 MB) | **7.7 ms** | Fast at boot (official compaction available via `t3 doctor`) |
+| Parallel post-boot probes (non-blocking) | **1.1–1.7 s** | `withCodexAppServerClient` (`1.46 s`), `runClaudeCommand` (`1.19 s`), `runGrokCliCommand` (`1.15 s`), `tailscale` (`1.04 s`), `git` repo identity (`1.1 s`) |
 
 ---
 
-## Fichiers du dépôt
+## Repository Files
 
-- [`open-in-t3code.cs`](open-in-t3code.cs) — Source du lanceur natif C# WinExe (IPC direct sur named pipe, ~70 ms à chaud / ~5,4 s à froid)
-- [`open-in-t3code.vbs`](open-in-t3code.vbs) — Lanceur VBScript de secours avec détection pipe `0 ms`
-- [`install.ps1`](install.ps1) — Compilation de `open-in-t3code.exe` + installation du menu contextuel (`HKCU`)
-- [`uninstall.ps1`](uninstall.ps1) — Désinstallation complète du menu contextuel
-- [`optimize-t3code.ps1`](optimize-t3code.ps1) — Optimisations locales (`enableProviderUpdateChecks`, purge logs, SQLite, autostart optionnel)
-- [`add-defender-exclusions.ps1`](add-defender-exclusions.ps1) — Ajout des exclusions Windows Defender (avec élévation UAC)
-- [`remove-defender-exclusions.ps1`](remove-defender-exclusions.ps1) — Suppression des exclusions Windows Defender
+- [`open-in-t3code.cs`](open-in-t3code.cs) — Native C# WinExe launcher (direct named-pipe IPC, ~70 ms warm / ~4.7 s cold)
+- [`open-in-t3code.vbs`](open-in-t3code.vbs) — VBScript fallback launcher with `0 ms` pipe detection
+- [`install.ps1`](install.ps1) — Compiles `open-in-t3code.exe` and installs Windows Explorer context menu (`HKCU`)
+- [`uninstall.ps1`](uninstall.ps1) — Cleanly removes context menu entries and launcher files
+- [`optimize-t3code.ps1`](optimize-t3code.ps1) — Local T3 Code optimizer (`enableProviderUpdateChecks`, log cleanup, SQLite maintenance, optional autostart)
+- [`add-defender-exclusions.ps1`](add-defender-exclusions.ps1) — Adds Windows Defender exclusions (with UAC prompt)
+- [`remove-defender-exclusions.ps1`](remove-defender-exclusions.ps1) — Removes Windows Defender exclusions
