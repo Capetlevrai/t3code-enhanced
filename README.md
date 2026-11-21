@@ -28,6 +28,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\add-defender-exclusions.ps
 
 `install.ps1` compiles [`open-in-t3code.cs`](open-in-t3code.cs) into a tiny (~8 KB) console-free WinExe using Windows' built-in `.NET 4` compiler (`csc.exe`). Instead of spawning Electron with `ELECTRON_RUN_AS_NODE=1` on every click, it talks directly to T3 Code's control named pipe (`\\.\pipe\t3code-app-<hash>`).
 
+## Limitations
+
+- Uses T3 Code's desktop control named-pipe protocol v1 (`\\.\pipe\t3code-app-<sha256_24>`) and default local backend readiness endpoint (`http://127.0.0.1:3773/.well-known/t3/environment`). If a future T3 Code release changes this internal protocol, `open-in-t3code.cs` may need an update (you can fall back to `open-in-t3code.vbs` in the meantime).
+- Relaunching immediately after closing T3 Code waits a few seconds for Electron's `SingleInstanceLock` to release during shutdown.
+- `optimize-t3code.ps1` disables `enableProviderUpdateChecks` (reversible in T3 Code settings) and only removes rotated trace archives (`*.ndjson.1`..`.10`); it never modifies T3 Code binaries or user data.
+
 ## Uninstall
 
 ```powershell
