@@ -1,3 +1,7 @@
+param(
+    [switch]$UseVbs
+)
+
 $ErrorActionPreference = "Stop"
 
 $label = "Ouvrir dans T3 Code"
@@ -12,7 +16,7 @@ $t3Dir = Join-Path $env:LOCALAPPDATA "Programs\t3code"
 $exePath = @(
     (Join-Path $t3Dir "T3 Code (Beta).exe"),
     (Join-Path $t3Dir "T3 Code.exe")
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
 if (-not $exePath) {
     throw "T3 Code est introuvable dans $t3Dir"
@@ -21,28 +25,28 @@ if (-not $exePath) {
 New-Item -ItemType Directory -Path $installDir -Force | Out-Null
 
 # Compute exact T3 Code control pipe path for 0 ms detection in VBS fallback
-$t3Home = if ($env:T3CODE_HOME) { $env:T3CODE_HOME } else { Join-Path $env:USERPROFILE ".t3" }
-$stateDir = Join-Path $t3Home "userdata"
+$t3Home = if ($env:T3CODE_HOME) { [System.IO.Path]::GetFullPath($env:T3CODE_HOME.Trim()) } else { Join-Path $env:USERPROFILE ".t3" }
+$stateDir = [System.IO.Path]::GetFullPath((Join-Path $t3Home "userdata"))
 $sha = [System.Security.Cryptography.SHA256]::Create()
 $hashBytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($stateDir))
 $pipeHash = -join ($hashBytes[0..11] | ForEach-Object { $_.ToString("x2") })
 $pipePath = "\\.\pipe\t3code-app-$pipeHash"
 
 # Always install optimized VBS fallback with injected pipe path
-$vbsContent = (Get-Content -Path $sourceVbs -Raw) -replace "__T3_PIPE_PATH__", $pipePath
-Set-Content -Path $targetVbs -Value $vbsContent -Encoding ASCII
+$vbsContent = (Get-Content -LiteralPath $sourceVbs -Raw) -replace "__T3_PIPE_PATH__", $pipePath
+Set-Content -LiteralPath $targetVbs -Value $vbsContent -Encoding ASCII
 
-# Prefer compiling native .NET WinExe launcher (~110 ms warm start, 0 ms cold-start detection)
+# Prefer compiling native .NET WinExe launcher (~70 ms warm start, 15 ms cold-start detection)
 $cscPath = @(
     "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe",
     "C:\Windows\Microsoft.NET\Framework\v4.0.30319\csc.exe"
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
+) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
 
 $useNativeExe = $false
-if ($cscPath -and (Test-Path $sourceCs)) {
+if (-not $UseVbs -and $cscPath -and (Test-Path -LiteralPath $sourceCs)) {
     Write-Host "Compilation du lanceur natif open-in-t3code.exe..." -ForegroundColor Cyan
     & $cscPath /nologo /target:winexe /optimize+ /out:"$targetExe" /r:System.Windows.Forms.dll /r:System.Core.dll "$sourceCs"
-    if ($LASTEXITCODE -eq 0 -and (Test-Path $targetExe)) {
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $targetExe)) {
         $useNativeExe = $true
     } else {
         Write-Warning "Compilation C# echouee, bascule sur open-in-t3code.vbs."
@@ -50,10 +54,11 @@ if ($cscPath -and (Test-Path $sourceCs)) {
 }
 
 $iconValue = "`"$exePath`",0"
+# Suffix `\.' inside quotes so drive roots like C:\ never escape the closing quote (C:\ -> C:\.\ -> C:\)
 $entries = @(
-    @{ Key = "HKCU:\Software\Classes\Directory\shell\T3CodeOpen";            Arg = "%1" },
-    @{ Key = "HKCU:\Software\Classes\Directory\Background\shell\T3CodeOpen"; Arg = "%V" },
-    @{ Key = "HKCU:\Software\Classes\Drive\shell\T3CodeOpen";                Arg = "%V" }
+    @{ Key = "HKCU:\Software\Classes\Directory\shell\T3CodeOpen";            Arg = "%1\." },
+    @{ Key = "HKCU:\Software\Classes\Directory\Background\shell\T3CodeOpen"; Arg = "%V\." },
+    @{ Key = "HKCU:\Software\Classes\Drive\shell\T3CodeOpen";                Arg = "%V\." }
 )
 
 foreach ($entry in $entries) {

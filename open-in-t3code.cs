@@ -5,8 +5,8 @@ using System.IO.Pipes;
 using System.Net;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
-using System.Threading.Tasks;
 using System.Windows.Forms;
 
 // Lightweight native launcher for "Ouvrir dans T3 Code" Windows Explorer context menu.
@@ -33,18 +33,7 @@ static class Program
             return 1;
         }
 
-        string targetPath = args[0].Trim().Trim('"');
-        while (targetPath.Length > 3 && targetPath.EndsWith("\\"))
-        {
-            targetPath = targetPath.Substring(0, targetPath.Length - 1);
-        }
-
-        try
-        {
-            targetPath = Path.GetFullPath(targetPath);
-        }
-        catch { }
-
+        string targetPath = NormalizeFolderArg(args[0]);
         Log("Target folder: " + targetPath);
 
         if (!Directory.Exists(targetPath))
@@ -76,10 +65,15 @@ static class Program
         {
             t3Home = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".t3");
         }
-        string stateDir = Path.Combine(t3Home, "userdata");
-        string devStateDir = Path.Combine(t3Home, "dev");
+        else
+        {
+            t3Home = Path.GetFullPath(t3Home.Trim());
+        }
+        string stateDir = Path.GetFullPath(Path.Combine(t3Home, "userdata"));
+        string devStateDir = Path.GetFullPath(Path.Combine(t3Home, "dev"));
 
-        string primaryPipe = "t3code-app-" + ShortSha256(stateDir);
+        string primaryPipeHash = ShortSha256(stateDir);
+        string primaryPipe = "t3code-app-" + primaryPipeHash;
         string devPipe = "t3code-app-" + ShortSha256(devStateDir);
         string primaryPipePath = @"\\.\pipe\" + primaryPipe;
         string devPipePath = @"\\.\pipe\" + devPipe;
@@ -104,44 +98,17 @@ static class Program
             Log("Step 1: Pipe absent (app closed) -> immediate cold start");
         }
 
-        // Step 2: Cold start — if T3 Code processes are still shutting down (pipe gone but
-        // SingleInstanceLock still held for ~5s during backend closeScope), wait for them to exit
-        // before spawning a new instance so Electron doesn't exit immediately on second-instance.
+        // Step 2: Cold start coordinated via per-user/profile Mutex so concurrent Explorer clicks
+        // or rapid close-and-relaunch never fight over Electron's SingleInstanceLock.
         string exeProcName = Path.GetFileNameWithoutExtension(exePath);
-        bool needLaunch = true;
-        if (Process.GetProcessesByName(exeProcName).Length > 0)
-        {
-            Log("Step 2: Pipe absent but " + exeProcName + " is still running (shutting down or booting); waiting...");
-            var waitExitSw = Stopwatch.StartNew();
-            while (waitExitSw.ElapsedMilliseconds < 10000)
-            {
-                if (File.Exists(primaryPipePath) || File.Exists(devPipePath))
-                {
-                    Log("Step 2: Pipe appeared after " + waitExitSw.ElapsedMilliseconds + "ms (app was booting)");
-                    needLaunch = false;
-                    break;
-                }
-                if (Process.GetProcessesByName(exeProcName).Length == 0)
-                {
-                    Log("Step 2: Previous instance exited after " + waitExitSw.ElapsedMilliseconds + "ms");
-                    break;
-                }
-                Thread.Sleep(150);
-            }
-        }
-
+        string mutexName = @"Local\T3CodeLauncher_" + primaryPipeHash;
         Process launchedProc = null;
         int launchCount = 0;
-        if (needLaunch)
-        {
-            launchedProc = LaunchT3Code(exePath, installDir);
-            if (launchedProc == null) return 1;
-            launchCount = 1;
-        }
 
-        // Step 3: Poll for the named pipe every 100 ms (0 ms per File.Exists check),
-        // then wait for the local backend HTTP readiness (returns immediately on HTTP 200)
-        // before sending IPC so T3 Code doesn't stall inside an early timeout.
+        EnsureT3CodeStarted(mutexName, exePath, installDir, exeProcName, primaryPipePath, devPipePath, ref launchedProc, ref launchCount);
+
+        // Step 3: Poll for the named pipe every 100 ms, wait for local backend HTTP readiness
+        // (reading dynamic port from server-runtime.json), then send IPC within overall deadline.
         const int maxWaitMs = 45000;
         int attempts = 0;
         bool waitedForBackend = false;
@@ -154,14 +121,21 @@ static class Program
             {
                 if (!waitedForBackend)
                 {
-                    Log("Step 3: Pipe appeared, waiting for local backend readiness");
-                    WaitForLocalBackend(12000);
+                    int remainingForBackend = (int)Math.Max(0, Math.Min(12000, maxWaitMs - Sw.ElapsedMilliseconds - 5000));
+                    if (remainingForBackend > 0)
+                    {
+                        Log("Step 3: Pipe appeared, waiting for local backend readiness");
+                        WaitForLocalBackend(stateDir, remainingForBackend);
+                    }
                     waitedForBackend = true;
                 }
 
+                int remainingMs = (int)(maxWaitMs - Sw.ElapsedMilliseconds);
+                if (remainingMs <= 500) break;
+
                 attempts++;
                 Log("Step 3: Sending open-workspace (attempt " + attempts + ")");
-                int ipcTimeout = (attempts == 1) ? 8000 : 12000;
+                int ipcTimeout = Math.Min(remainingMs, (attempts == 1) ? 8000 : 12000);
                 if (SendOpenWorkspace(readyPipe, targetPath, ipcTimeout, out lastErr))
                 {
                     Log("SUCCESS (cold start on IPC attempt " + attempts + ")");
@@ -172,23 +146,14 @@ static class Program
             }
             else
             {
-                // Guard against Electron single-instance race: if our launched process exited
-                // immediately while a previous instance was dying, wait briefly and relaunch.
-                if (launchedProc != null && launchedProc.HasExited && launchCount < 3)
+                // Guard against both: (a) our launched process exiting on second-instance race,
+                // and (b) a previously observed instance exiting after we skipped launching.
+                bool noProcessesLeft = Process.GetProcessesByName(exeProcName).Length == 0;
+                bool launchedExited = (launchedProc != null && launchedProc.HasExited);
+                if ((noProcessesLeft || launchedExited) && launchCount < 3)
                 {
-                    Log("Step 3: Launched process exited early (code=" + launchedProc.ExitCode + "); waiting for clean state and relaunching");
-                    var raceSw = Stopwatch.StartNew();
-                    while (raceSw.ElapsedMilliseconds < 6000 && Process.GetProcessesByName(exeProcName).Length > 0)
-                    {
-                        if (File.Exists(primaryPipePath) || File.Exists(devPipePath)) break;
-                        Thread.Sleep(150);
-                    }
-                    if (!File.Exists(primaryPipePath) && !File.Exists(devPipePath))
-                    {
-                        launchedProc = LaunchT3Code(exePath, installDir);
-                        if (launchedProc == null) return 1;
-                        launchCount++;
-                    }
+                    Log("Step 3: No active pipe and instance absent/exited (noProcs=" + noProcessesLeft + ", launchedExited=" + launchedExited + "); ensuring launch");
+                    EnsureT3CodeStarted(mutexName, exePath, installDir, exeProcName, primaryPipePath, devPipePath, ref launchedProc, ref launchCount);
                 }
                 Thread.Sleep(100);
             }
@@ -201,6 +166,89 @@ static class Program
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
         return 1;
+    }
+
+    private static string NormalizeFolderArg(string raw)
+    {
+        string p = raw.Trim().Trim('"');
+        // Defensive fix: Windows argv parsing turns `"C:\"` into `C:"` -> `C:` after Trim('"').
+        // `C:` means current working directory of drive C, NOT `C:\`!
+        if (p.Length == 2 && char.IsLetter(p[0]) && p[1] == ':')
+        {
+            p = p + "\\";
+        }
+        try
+        {
+            p = Path.GetFullPath(p);
+        }
+        catch { }
+        // Trim trailing slash except for drive roots (C:\) and UNC roots
+        while (p.Length > 3 && p.EndsWith("\\") && !p.StartsWith(@"\\"))
+        {
+            p = p.Substring(0, p.Length - 1);
+        }
+        return p;
+    }
+
+    private static void EnsureT3CodeStarted(
+        string mutexName,
+        string exePath,
+        string installDir,
+        string exeProcName,
+        string primaryPipePath,
+        string devPipePath,
+        ref Process launchedProc,
+        ref int launchCount)
+    {
+        bool createdNew;
+        using (var mutex = new Mutex(false, mutexName, out createdNew))
+        {
+            bool acquired = false;
+            try
+            {
+                try { acquired = mutex.WaitOne(12000); }
+                catch (AbandonedMutexException) { acquired = true; }
+
+                if (File.Exists(primaryPipePath) || File.Exists(devPipePath))
+                {
+                    return;
+                }
+
+                // Wait for any shutting-down T3 Code processes (closeScope takes ~5s) to release SingleInstanceLock
+                if (Process.GetProcessesByName(exeProcName).Length > 0)
+                {
+                    Log("Step 2: Pipe absent while " + exeProcName + " is running (shutting down or booting); waiting...");
+                    var waitExitSw = Stopwatch.StartNew();
+                    while (waitExitSw.ElapsedMilliseconds < 10000)
+                    {
+                        if (File.Exists(primaryPipePath) || File.Exists(devPipePath))
+                        {
+                            Log("Step 2: Pipe appeared after " + waitExitSw.ElapsedMilliseconds + "ms");
+                            return;
+                        }
+                        if (Process.GetProcessesByName(exeProcName).Length == 0)
+                        {
+                            Log("Step 2: Previous instance exited after " + waitExitSw.ElapsedMilliseconds + "ms");
+                            break;
+                        }
+                        Thread.Sleep(150);
+                    }
+                }
+
+                if (!File.Exists(primaryPipePath) && !File.Exists(devPipePath) && launchCount < 3)
+                {
+                    launchedProc = LaunchT3Code(exePath, installDir);
+                    if (launchedProc != null) launchCount++;
+                }
+            }
+            finally
+            {
+                if (acquired)
+                {
+                    try { mutex.ReleaseMutex(); } catch { }
+                }
+            }
+        }
     }
 
     private static Process LaunchT3Code(string exePath, string installDir)
@@ -228,14 +276,35 @@ static class Program
         }
     }
 
-    private static void WaitForLocalBackend(int maxWaitMs)
+    private static int ResolveBackendPort(string stateDir)
+    {
+        try
+        {
+            string runtimeFile = Path.Combine(stateDir, "server-runtime.json");
+            if (File.Exists(runtimeFile))
+            {
+                string content = File.ReadAllText(runtimeFile, Encoding.UTF8);
+                Match m = Regex.Match(content, "\"port\"\\s*:\\s*(\\d+)");
+                int port;
+                if (m.Success && int.TryParse(m.Groups[1].Value, out port) && port > 0 && port <= 65535)
+                {
+                    return port;
+                }
+            }
+        }
+        catch { }
+        return 3773;
+    }
+
+    private static void WaitForLocalBackend(string stateDir, int maxWaitMs)
     {
         var sw = Stopwatch.StartNew();
         while (sw.ElapsedMilliseconds < maxWaitMs)
         {
+            int port = ResolveBackendPort(stateDir);
             try
             {
-                var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:3773/.well-known/t3/environment");
+                var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + "/.well-known/t3/environment");
                 req.Method = "GET";
                 req.Timeout = 400;
                 req.ReadWriteTimeout = 400;
@@ -244,10 +313,16 @@ static class Program
                 {
                     if ((int)resp.StatusCode == 200)
                     {
-                        Log("Step 3: Local backend ready after " + sw.ElapsedMilliseconds + "ms");
-                        // Small settle delay for renderer WebSocket handshake
-                        Thread.Sleep(350);
-                        return;
+                        using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                        {
+                            string body = sr.ReadToEnd();
+                            if (body.Contains("environmentId") || body.Contains("t3"))
+                            {
+                                Log("Step 3: Local backend ready on port " + port + " after " + sw.ElapsedMilliseconds + "ms");
+                                Thread.Sleep(350);
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -298,7 +373,9 @@ static class Program
                         error = "empty response";
                         return false;
                     }
-                    if (line.Contains("\"ok\":true"))
+                    bool idMatch = line.Contains("\"" + requestId + "\"");
+                    bool okTrue = Regex.IsMatch(line, "\"ok\"\\s*:\\s*true");
+                    if (idMatch && okTrue)
                     {
                         return true;
                     }

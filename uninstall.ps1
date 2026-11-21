@@ -13,8 +13,10 @@ foreach ($key in $keys) {
 }
 
 $installDir = Join-Path $env:LOCALAPPDATA "t3code-context-menu"
-if (Test-Path $installDir) {
-    Remove-Item -Path $installDir -Recurse -Force
+if (Test-Path -LiteralPath $installDir) {
+    Remove-Item -LiteralPath $installDir -Recurse -Force
 }
 
-Write-Host "Raccourci T3 Code desinstalle proprement." -ForegroundColor Yellow
+Remove-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "T3CodeBackground" -ErrorAction SilentlyContinue
+
+Write-Host "Raccourci T3 Code (et autostart eventuel) desinstalle proprement." -ForegroundColor Yellow
