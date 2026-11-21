@@ -104,27 +104,39 @@ static class Program
             Log("Step 1: Pipe absent (app closed) -> immediate cold start");
         }
 
-        // Step 2: Cold start — launch T3 Code GUI cleanly without ELECTRON_RUN_AS_NODE
-        try
+        // Step 2: Cold start — if T3 Code processes are still shutting down (pipe gone but
+        // SingleInstanceLock still held for ~5s during backend closeScope), wait for them to exit
+        // before spawning a new instance so Electron doesn't exit immediately on second-instance.
+        string exeProcName = Path.GetFileNameWithoutExtension(exePath);
+        bool needLaunch = true;
+        if (Process.GetProcessesByName(exeProcName).Length > 0)
         {
-            var psi = new ProcessStartInfo
+            Log("Step 2: Pipe absent but " + exeProcName + " is still running (shutting down or booting); waiting...");
+            var waitExitSw = Stopwatch.StartNew();
+            while (waitExitSw.ElapsedMilliseconds < 10000)
             {
-                FileName = exePath,
-                WorkingDirectory = installDir,
-                UseShellExecute = false
-            };
-            psi.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE");
-            psi.EnvironmentVariables.Remove("SSH_CONNECTION");
-            psi.EnvironmentVariables.Remove("SSH_TTY");
-
-            Log("Step 2: Launching T3 Code GUI: " + exePath);
-            Process.Start(psi);
+                if (File.Exists(primaryPipePath) || File.Exists(devPipePath))
+                {
+                    Log("Step 2: Pipe appeared after " + waitExitSw.ElapsedMilliseconds + "ms (app was booting)");
+                    needLaunch = false;
+                    break;
+                }
+                if (Process.GetProcessesByName(exeProcName).Length == 0)
+                {
+                    Log("Step 2: Previous instance exited after " + waitExitSw.ElapsedMilliseconds + "ms");
+                    break;
+                }
+                Thread.Sleep(150);
+            }
         }
-        catch (Exception ex)
+
+        Process launchedProc = null;
+        int launchCount = 0;
+        if (needLaunch)
         {
-            Log("ERROR launching T3 Code: " + ex.Message);
-            MessageBox.Show("Impossible de lancer T3 Code : " + ex.Message, "T3 Code", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            return 1;
+            launchedProc = LaunchT3Code(exePath, installDir);
+            if (launchedProc == null) return 1;
+            launchCount = 1;
         }
 
         // Step 3: Poll for the named pipe every 100 ms (0 ms per File.Exists check),
@@ -160,6 +172,24 @@ static class Program
             }
             else
             {
+                // Guard against Electron single-instance race: if our launched process exited
+                // immediately while a previous instance was dying, wait briefly and relaunch.
+                if (launchedProc != null && launchedProc.HasExited && launchCount < 3)
+                {
+                    Log("Step 3: Launched process exited early (code=" + launchedProc.ExitCode + "); waiting for clean state and relaunching");
+                    var raceSw = Stopwatch.StartNew();
+                    while (raceSw.ElapsedMilliseconds < 6000 && Process.GetProcessesByName(exeProcName).Length > 0)
+                    {
+                        if (File.Exists(primaryPipePath) || File.Exists(devPipePath)) break;
+                        Thread.Sleep(150);
+                    }
+                    if (!File.Exists(primaryPipePath) && !File.Exists(devPipePath))
+                    {
+                        launchedProc = LaunchT3Code(exePath, installDir);
+                        if (launchedProc == null) return 1;
+                        launchCount++;
+                    }
+                }
                 Thread.Sleep(100);
             }
         }
@@ -171,6 +201,31 @@ static class Program
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
         return 1;
+    }
+
+    private static Process LaunchT3Code(string exePath, string installDir)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exePath,
+                WorkingDirectory = installDir,
+                UseShellExecute = false
+            };
+            psi.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE");
+            psi.EnvironmentVariables.Remove("SSH_CONNECTION");
+            psi.EnvironmentVariables.Remove("SSH_TTY");
+
+            Log("Step 2: Launching T3 Code GUI: " + exePath);
+            return Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            Log("ERROR launching T3 Code: " + ex.Message);
+            MessageBox.Show("Impossible de lancer T3 Code : " + ex.Message, "T3 Code", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return null;
+        }
     }
 
     private static void WaitForLocalBackend(int maxWaitMs)
