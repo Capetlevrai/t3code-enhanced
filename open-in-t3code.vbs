@@ -58,6 +58,12 @@ If Left(targetPath, 1) = """" And Right(targetPath, 1) = """" Then
     targetPath = Mid(targetPath, 2, Len(targetPath) - 2)
 End If
 
+' install.ps1 passes "%1\." so drive roots never end in \" ; resolve the "\." (and any "..")
+' so T3 Code receives C:\foo, not C:\foo\. (which would register a different project path).
+On Error Resume Next
+targetPath = fso.GetAbsolutePathName(targetPath)
+On Error GoTo 0
+
 ' Normalize trailing backslash (keep drive roots like C:\ intact)
 Do While Len(targetPath) > 3 And Right(targetPath, 1) = "\"
     targetPath = Left(targetPath, Len(targetPath) - 1)
@@ -107,7 +113,7 @@ env.Remove "SSH_CONNECTION"
 env.Remove "SSH_TTY"
 On Error GoTo 0
 
-' Step 1: Fast path — check in < 1 ms if T3 Code control pipe exists before calling `t3 app`
+' Step 1: Fast path - check in < 1 ms if T3 Code control pipe exists before calling `t3 app`
 If IsT3AppReady() Then
     env("ELECTRON_RUN_AS_NODE") = "1"
     WriteLog "Step 1: Pipe/process detected, running t3 app (fast path)"
@@ -121,7 +127,7 @@ Else
     WriteLog "Step 1: Skipped (T3 Code not running) -> immediate cold start"
 End If
 
-' Step 2: Cold start — launch T3 Code GUI cleanly without ELECTRON_RUN_AS_NODE
+' Step 2: Cold start - launch T3 Code GUI cleanly without ELECTRON_RUN_AS_NODE
 On Error Resume Next
 env.Remove "ELECTRON_RUN_AS_NODE"
 On Error GoTo 0

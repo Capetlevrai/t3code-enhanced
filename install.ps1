@@ -45,12 +45,29 @@ $cscPath = @(
 $useNativeExe = $false
 if (-not $UseVbs -and $cscPath -and (Test-Path -LiteralPath $sourceCs)) {
     Write-Host "Compilation du lanceur natif open-in-t3code.exe..." -ForegroundColor Cyan
-    & $cscPath /nologo /target:winexe /optimize+ /out:"$targetExe" /r:System.Windows.Forms.dll /r:System.Core.dll "$sourceCs"
-    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $targetExe)) {
+    # Compile to a temp file first: if the current exe is running (a launcher still waiting on a
+    # cold start) csc cannot overwrite it, and we must not silently downgrade to the VBS launcher.
+    $newExe = "$targetExe.new"
+    Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue
+    & $cscPath /nologo /target:winexe /optimize+ /out:"$newExe" /r:System.Windows.Forms.dll /r:System.Core.dll "$sourceCs"
+    if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $newExe)) {
+        try {
+            Move-Item -LiteralPath $newExe -Destination $targetExe -Force
+        } catch {
+            # Running exes can be renamed but not overwritten on Windows.
+            $oldExe = "$targetExe.old"
+            Remove-Item -LiteralPath $oldExe -Force -ErrorAction SilentlyContinue
+            Move-Item -LiteralPath $targetExe -Destination $oldExe -Force
+            Move-Item -LiteralPath $newExe -Destination $targetExe -Force
+        }
+        $useNativeExe = $true
+    } elseif (Test-Path -LiteralPath $targetExe) {
+        Write-Warning "Compilation C# echouee, conservation du lanceur natif deja installe."
         $useNativeExe = $true
     } else {
         Write-Warning "Compilation C# echouee, bascule sur open-in-t3code.vbs."
     }
+    Remove-Item -LiteralPath $newExe -Force -ErrorAction SilentlyContinue
 }
 
 $iconValue = "`"$exePath`",0"

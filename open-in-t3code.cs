@@ -86,11 +86,13 @@ static class Program
         {
             Log("Step 1: Pipe detected, sending open-workspace directly");
             string err;
-            if (SendOpenWorkspace(activePipe, targetPath, 5000, out err))
+            IpcResult warm = SendOpenWorkspace(activePipe, targetPath, out err);
+            if (warm == IpcResult.Ok)
             {
                 Log("SUCCESS (warm start)");
                 return 0;
             }
+            if (warm == IpcResult.Fatal) return FailWithT3Message(err);
             Log("Step 1 failed (" + err + "), falling back to cold start");
         }
         else
@@ -135,12 +137,13 @@ static class Program
 
                 attempts++;
                 Log("Step 3: Sending open-workspace (attempt " + attempts + ")");
-                int ipcTimeout = Math.Min(remainingMs, (attempts == 1) ? 8000 : 12000);
-                if (SendOpenWorkspace(readyPipe, targetPath, ipcTimeout, out lastErr))
+                IpcResult cold = SendOpenWorkspace(readyPipe, targetPath, out lastErr);
+                if (cold == IpcResult.Ok)
                 {
                     Log("SUCCESS (cold start on IPC attempt " + attempts + ")");
                     return 0;
                 }
+                if (cold == IpcResult.Fatal) return FailWithT3Message(lastErr);
                 Log("Step 3 IPC attempt " + attempts + " failed: " + lastErr);
                 Thread.Sleep(250);
             }
@@ -161,7 +164,20 @@ static class Program
 
         Log("FAILED after " + Sw.ElapsedMilliseconds + "ms. Last error: " + lastErr);
         MessageBox.Show(
-            "Impossible d'ouvrir le dossier dans T3 Code apres le demarrage.\nLog : " + _logPath,
+            "Impossible d'ouvrir le dossier dans T3 Code apres le demarrage.\n" + lastErr + "\n\nLog : " + _logPath,
+            "T3 Code",
+            MessageBoxButtons.OK,
+            MessageBoxIcon.Warning);
+        return 1;
+    }
+
+    // T3 Code answered ok:false with a code that retrying cannot fix (platform-mismatch,
+    // project-create-failed, thread-open-failed, invalid-request): show its own message.
+    private static int FailWithT3Message(string error)
+    {
+        Log("FAILED (T3 Code refused the request) after " + Sw.ElapsedMilliseconds + "ms: " + error);
+        MessageBox.Show(
+            "T3 Code n'a pas pu ouvrir ce dossier :\n" + error + "\n\nLog : " + _logPath,
             "T3 Code",
             MessageBoxButtons.OK,
             MessageBoxIcon.Warning);
@@ -285,15 +301,33 @@ static class Program
             {
                 string content = File.ReadAllText(runtimeFile, Encoding.UTF8);
                 Match m = Regex.Match(content, "\"port\"\\s*:\\s*(\\d+)");
-                int port;
-                if (m.Success && int.TryParse(m.Groups[1].Value, out port) && port > 0 && port <= 65535)
+                Match pidMatch = Regex.Match(content, "\"pid\"\\s*:\\s*(\\d+)");
+                int port, pid;
+                // Ignore a stale file left by a previous backend (its pid is gone): the new backend
+                // rewrites it once it listens, and we re-read it on every poll.
+                bool stale = pidMatch.Success && int.TryParse(pidMatch.Groups[1].Value, out pid) && !IsProcessAlive(pid);
+                if (!stale && m.Success && int.TryParse(m.Groups[1].Value, out port) && port > 0 && port <= 65535)
                 {
                     return port;
                 }
             }
         }
         catch { }
+        int envPort;
+        if (int.TryParse(Environment.GetEnvironmentVariable("T3CODE_PORT"), out envPort) && envPort > 0 && envPort <= 65535)
+        {
+            return envPort;
+        }
         return 3773;
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            using (var p = Process.GetProcessById(pid)) return !p.HasExited;
+        }
+        catch { return false; }
     }
 
     private static void WaitForLocalBackend(string stateDir, int maxWaitMs)
@@ -335,14 +369,23 @@ static class Program
         Log("Step 3: Local backend wait timed out (" + maxWaitMs + "ms), proceeding to IPC");
     }
 
-    private static bool SendOpenWorkspace(string pipeName, string workspaceRoot, int timeoutMs, out string error)
+    private enum IpcResult { Ok, Retry, Fatal }
+
+    // T3 Code queues the request until its window is ready and always answers within 15 s
+    // (REQUEST_TIMEOUT_MS in DesktopAppActivation). Closing the pipe before that cancels the
+    // request while the renderer may already be adding the project, and a retry could then add
+    // it twice. So the read timeout is always longer than T3 Code's own deadline.
+    private const int IpcReadTimeoutMs = 20000;
+
+    private static IpcResult SendOpenWorkspace(string pipeName, string workspaceRoot, out string error)
     {
         error = null;
+        const int timeoutMs = IpcReadTimeoutMs;
         try
         {
             using (var client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
             {
-                client.Connect(Math.Min(timeoutMs, 2000));
+                client.Connect(2000);
 
                 string requestId = Guid.NewGuid().ToString();
                 string payload =
@@ -355,7 +398,7 @@ static class Program
                 if (!writeTask.Wait(2000))
                 {
                     error = "write timeout";
-                    return false;
+                    return IpcResult.Retry;
                 }
                 client.Flush();
 
@@ -365,22 +408,21 @@ static class Program
                     if (!readTask.Wait(timeoutMs))
                     {
                         error = "read timeout (" + timeoutMs + "ms)";
-                        return false;
+                        return IpcResult.Retry;
                     }
                     string line = readTask.Result;
                     if (string.IsNullOrEmpty(line))
                     {
                         error = "empty response";
-                        return false;
+                        return IpcResult.Retry;
                     }
                     bool idMatch = line.Contains("\"" + requestId + "\"");
                     bool okTrue = Regex.IsMatch(line, "\"ok\"\\s*:\\s*true");
                     if (idMatch && okTrue)
                     {
-                        return true;
+                        return IpcResult.Ok;
                     }
-                    error = "response=" + line;
-                    return false;
+                    return ClassifyFailure(line, out error);
                 }
             }
         }
@@ -388,12 +430,40 @@ static class Program
         {
             var inner = aex.InnerException ?? aex;
             error = inner.GetType().Name + ": " + inner.Message;
-            return false;
+            return IpcResult.Retry;
         }
         catch (Exception ex)
         {
             error = ex.GetType().Name + ": " + ex.Message;
-            return false;
+            return IpcResult.Retry;
+        }
+    }
+
+    // Response shape: {"version":1,"requestId":"...","ok":false,"code":"...","message":"..."}
+    private static IpcResult ClassifyFailure(string line, out string error)
+    {
+        Match code = Regex.Match(line, "\"code\"\\s*:\\s*\"([a-z-]+)\"");
+        Match msg = Regex.Match(line, "\"message\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
+        string message = line;
+        if (msg.Success)
+        {
+            try { message = Regex.Unescape(msg.Groups[1].Value); } catch { message = msg.Groups[1].Value; }
+        }
+        string codeValue = code.Success ? code.Groups[1].Value : "";
+        error = (codeValue.Length > 0 ? codeValue + ": " : "") + message;
+        switch (codeValue)
+        {
+            // Window not ready yet, local environment still connecting, app restarting: retry.
+            case "renderer-unavailable":
+            case "environment-unavailable":
+            case "request-timeout":
+            case "internal-error":
+            case "":
+                return IpcResult.Retry;
+            // invalid-request, platform-mismatch, project-create-failed, thread-open-failed:
+            // retrying cannot help and could duplicate work.
+            default:
+                return IpcResult.Fatal;
         }
     }
 
@@ -440,8 +510,9 @@ static class Program
         {
             File.AppendAllText(
                 _logPath,
-                DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss.fff") + " (+" + Sw.ElapsedMilliseconds + "ms) | " + msg + Environment.NewLine,
-                Encoding.UTF8);
+                DateTime.Now.ToString("dd/MM/yyyy HH:mm:ss.fff") + " [pid " + Process.GetCurrentProcess().Id + "] (+" +
+                Sw.ElapsedMilliseconds + "ms) | " + msg + Environment.NewLine,
+                new UTF8Encoding(false));
         }
         catch { }
     }
