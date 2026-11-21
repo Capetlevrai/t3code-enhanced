@@ -1,9 +1,13 @@
 Option Explicit
 
-Dim shell, fso, env, logFile
+Dim shell, fso, env, logFile, tStart
 Set shell = CreateObject("WScript.Shell")
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set env = shell.Environment("Process")
+tStart = Timer
+
+' Optional pipe name injected by install.ps1 for 0 ms detection (e.g. \\.\pipe\t3code-app-<hash>)
+Const T3_PIPE_PATH = "__T3_PIPE_PATH__"
 
 Dim appDataDir, logPath
 appDataDir = shell.ExpandEnvironmentStrings("%LOCALAPPDATA%") & "\t3code-context-menu"
@@ -16,12 +20,27 @@ logPath = appDataDir & "\last-run.log"
 
 Sub WriteLog(msg)
     On Error Resume Next
-    Dim ts
+    Dim ts, elapsedMs
+    elapsedMs = CLng((Timer - tStart) * 1000)
+    If elapsedMs < 0 Then elapsedMs = 0
     Set ts = fso.OpenTextFile(logPath, 8, True)
-    ts.WriteLine Now & " | " & msg
+    ts.WriteLine Now & " (+" & elapsedMs & "ms) | " & msg
     ts.Close
     On Error GoTo 0
 End Sub
+
+Function IsT3AppReady()
+    If Left(T3_PIPE_PATH, 9) = "\\.\pipe\" Then
+        IsT3AppReady = fso.FileExists(T3_PIPE_PATH)
+    Else
+        On Error Resume Next
+        Dim wmi, procs
+        Set wmi = GetObject("winmgmts:\\.\root\cimv2")
+        Set procs = wmi.ExecQuery("SELECT ProcessId FROM Win32_Process WHERE Name='T3 Code (Beta).exe' OR Name='T3 Code.exe'")
+        IsT3AppReady = (Err.Number = 0 And procs.Count > 0)
+        On Error GoTo 0
+    End If
+End Function
 
 ' Reset log for this run
 On Error Resume Next
@@ -88,15 +107,18 @@ env.Remove "SSH_CONNECTION"
 env.Remove "SSH_TTY"
 On Error GoTo 0
 
-' Step 1: Fast path — try activating an already-running T3 Code desktop app
-env("ELECTRON_RUN_AS_NODE") = "1"
-WriteLog "Step 1: Running t3 app (fast path)"
-exitCode = shell.Run(cmd, 0, True)
-WriteLog "Step 1 exitCode=" & exitCode
-
-If exitCode = 0 Then
-    WriteLog "SUCCESS (fast path)"
-    WScript.Quit 0
+' Step 1: Fast path — check in < 1 ms if T3 Code control pipe exists before calling `t3 app`
+If IsT3AppReady() Then
+    env("ELECTRON_RUN_AS_NODE") = "1"
+    WriteLog "Step 1: Pipe/process detected, running t3 app (fast path)"
+    exitCode = shell.Run(cmd, 0, True)
+    WriteLog "Step 1 exitCode=" & exitCode
+    If exitCode = 0 Then
+        WriteLog "SUCCESS (fast path)"
+        WScript.Quit 0
+    End If
+Else
+    WriteLog "Step 1: Skipped (T3 Code not running) -> immediate cold start"
 End If
 
 ' Step 2: Cold start — launch T3 Code GUI cleanly without ELECTRON_RUN_AS_NODE
@@ -108,21 +130,31 @@ WriteLog "Step 2: Launching T3 Code GUI: " & exePath
 shell.CurrentDirectory = installDir
 shell.Run """" & exePath & """", 1, False
 
-' Give Electron a moment to start booting
-WScript.Sleep 2000
+' Wait for control pipe to appear (0 ms per check, up to 20s) before calling `t3 app`
+If Left(T3_PIPE_PATH, 9) = "\\.\pipe\" Then
+    For i = 1 To 200
+        If fso.FileExists(T3_PIPE_PATH) Then
+            WriteLog "Step 2: Control pipe appeared after " & (i * 100) & "ms"
+            Exit For
+        End If
+        WScript.Sleep 100
+    Next
+Else
+    WScript.Sleep 1500
+End If
 
-' Step 3: Poll `t3 app` until the desktop app + renderer are ready (up to ~35s)
+' Step 3: Activate workspace via `t3 app` once pipe is up
 env("ELECTRON_RUN_AS_NODE") = "1"
-For i = 1 To 40
+For i = 1 To 20
     exitCode = shell.Run(cmd, 0, True)
     WriteLog "Step 3 attempt " & i & " exitCode=" & exitCode
     If exitCode = 0 Then
         WriteLog "SUCCESS (cold start on attempt " & i & ")"
         WScript.Quit 0
     End If
-    WScript.Sleep 750
+    WScript.Sleep 500
 Next
 
-WriteLog "FAILED after 40 attempts. Last exitCode=" & exitCode
+WriteLog "FAILED after 20 attempts. Last exitCode=" & exitCode
 MsgBox "Impossible d'ouvrir le dossier dans T3 Code apres le demarrage." & vbCrLf & "Log : " & logPath, vbExclamation, "T3 Code"
 WScript.Quit exitCode
