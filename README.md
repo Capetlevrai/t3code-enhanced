@@ -2,6 +2,10 @@
 
 Instant Windows Explorer right-click integration and startup optimizations for **T3 Code** (`pingdotgg/t3code`).
 
+<p>
+  <img src="assets/context-menu.png" alt="Open in T3 Code Windows Explorer context menu" width="320" />
+</p>
+
 ## Benchmarks
 
 | Action | Before | After | Speedup |
