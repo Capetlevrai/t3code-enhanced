@@ -32,6 +32,8 @@
     Retire l'instance (seulement si c'est bien une instance Pi pointant vers omp-t3) et ses favoris.
     Ne desinstalle rien.
 #>
+# No positional binding: with `-File`, `-Favorites "a", "b"` would otherwise bind "b" to another parameter.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$InstanceId = "ohmypi",
     [string]$DisplayName = "Oh My Pi",
@@ -39,7 +41,10 @@ param(
     [string]$OmpT3Version = "1.5.0",
     [switch]$SkipInstall,
     [switch]$Force,
-    [switch]$Remove
+    [switch]$Remove,
+    # `powershell -File x.ps1 -Favorites "a", "b"` delivers "b" as a stray argument: collect it as a favorite.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$MoreFavorites = @()
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,7 +56,10 @@ $PatchNew = "new ContractDoctor({ shimVersion: pkg.version, issuesEnabled: proce
 if ($InstanceId -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { throw "InstanceId invalide : $InstanceId" }
 
 # `powershell -File` passes "a","b" as ONE string: split on commas and strip quotes.
-$Favorites = @($Favorites | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().Trim('"', "'").Trim() } | Where-Object { $_ })
+foreach ($a in $MoreFavorites) {
+    if ($a -match '^-') { throw "Parametre inconnu : $a" }
+}
+$Favorites = @(@($Favorites) + @($MoreFavorites) | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().Trim('"', "'").Trim() } | Where-Object { $_ })
 
 $t3Home = if (-not [string]::IsNullOrWhiteSpace($env:T3CODE_HOME)) { [System.IO.Path]::GetFullPath($env:T3CODE_HOME.Trim().Trim('"')) } else { Join-Path $env:USERPROFILE ".t3" }
 $settingsPath = Join-Path (Join-Path $t3Home "userdata") "settings.json"
@@ -198,8 +206,8 @@ $depth = Get-JsonDepth $json
 if ($depth -gt $MaxJsonDepth) { throw "settings.json est trop imbrique ($depth niveaux > $MaxJsonDepth) pour une reecriture sure sous PowerShell ; rien n'a ete modifie." }
 $before = $json | ConvertTo-Json -Depth 32 -Compress
 
-if ($null -eq $json.PSObject.Properties["providerInstances"]) {
-    $json | Add-Member -NotePropertyName "providerInstances" -NotePropertyValue ([pscustomobject]@{})
+if ($null -eq $json.PSObject.Properties["providerInstances"] -or $null -eq $json.providerInstances) {
+    $json | Add-Member -NotePropertyName "providerInstances" -NotePropertyValue ([pscustomobject]@{}) -Force
 }
 $existing = $json.providerInstances.PSObject.Properties[$InstanceId]
 $favs = @()
@@ -245,7 +253,7 @@ if ($Remove) {
     }
     if ($null -eq $json.PSObject.Properties["favorites"]) {
         if ($favs.Count -gt 0) { $json | Add-Member -NotePropertyName "favorites" -NotePropertyValue @($favs) }
-    } else {
+    } elseif ($null -ne $json.favorites -or $favs.Count -gt 0) {
         $json.favorites = @($favs)
     }
 }
