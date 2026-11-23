@@ -2,7 +2,7 @@
 
 Field notes from setting these up on T3 Code 0.1.11 (Windows 11). Each item is a trap that cost time; the fix is listed with how to check it.
 
-Tested versions: T3 Code 0.1.11, OpenCode 2.3.2, omp 19.1.0, omp-t3 1.5.0, Bun 1.4.5, Node 24.
+Tested versions: T3 Code 0.1.11, OpenCode 2.3.2, omp 19.1.0 (Bun package), omp-t3 1.5.0, Bun 1.4.5, Node 24.
 
 ## 1. OpenCode: move to v2
 
@@ -87,7 +87,11 @@ Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3
    }
    ```
 
-2. **Bun version.** omp 19.x exits with `Bun runtime must be >= 1.4.4` on older Bun. Run `bun upgrade`, then `omp --version` should print `omp/19.x`. A failed global install can also leave `omp` pointing at a missing `dist/cli.js`: reinstall with `bun install -g @oh-my-pi/pi-coding-agent`.
+2. **omp version and install method.** omp exists in two forms that behave the same day to day: a **standalone** `omp.exe` (official installer, usually `%LOCALAPPDATA%\omp\omp.exe`, bundles its own runtime, no Bun needed; update with `omp update`) and the **Bun package** (`bun install -g @oh-my-pi/pi-coding-agent`, launcher in `~\.bunin`). Either is fine, but:
+   - it must be **omp 19.0.0 or later** (the setup was tested with 19.1.0); the script refuses older versions;
+   - keep **only one** `omp` on PATH: omp-t3 (and so T3 Code) runs the first one found, and the script warns when another one exists;
+   - the Bun package needs **Bun >= 1.4.4**: omp 19.x exits with `Bun runtime must be >= 1.4.4` on older Bun (`bun upgrade`). A failed global install can also leave `omp` pointing at a missing `dist/cli.js`: reinstall with `bun install -g @oh-my-pi/pi-coding-agent`.
+   - Bun is only installed or upgraded by the script when omp is missing or broken.
 
 3. **omp-t3 can file GitHub issues as you.** When it detects a protocol drift, it runs `gh issue create` on its own repo with your logged-in `gh` (at most once a day per drift). It has no switch to turn that off. `setup-oh-my-pi.ps1` patches the default in `src/doctor.js` so this only happens with `OMPT3_FILE_ISSUES=1`. It only trusts omp-t3 versions whose issue-filing code was audited (1.5.0 today): for any other version, or if the patch or its checks fail, it switches off existing Oh My Pi instances and stops. **Don't `npm update -g omp-t3` blindly:** a newer version is refused until it is audited (or until you read its code and pass `-AllowUnverifiedOmpT3`); go back with `-OmpT3Version 1.5.0`.
 
@@ -147,6 +151,8 @@ In T3 Code, *Oh My Pi* should list your omp models. A one-line prompt should the
 | *Pi CLI is installed but failed to run* | `binaryPath` is under `config`? `& "<binaryPath>" --version` exits 0? |
 | *Provider executable is not installed* (ACP) | `commandPath` is under `config`. |
 | Oh My Pi lists no models | `omp-t3 --check` reports the catalog size; `omp models ls` works in a terminal. |
-| `omp` crashes on start | `bun --version` ≥ 1.4.4. |
+| `omp` crashes on start | Bun package: `bun --version` ≥ 1.4.4. Standalone: `omp update`. |
+| Setup stops with *omp ... est trop ancien* (e.g. 18.x) | Standalone `omp.exe`: `omp update`. Bun package: `bun install -g @oh-my-pi/pi-coding-agent`. Then `omp --version` ≥ 19. |
+| Setup warns *Plusieurs omp sur ce PC* | `Get-Command omp -All` / `where.exe omp`: keep one (delete the other or take its folder off PATH). T3 Code runs the first one. |
 | Setup stops with *omp-t3 a change* | A new omp-t3 moved the issue-filing code: check `src/doctor.js` by hand before using it. |
 | OpenCode adapter errors after an update | `opencode --version` is 2.x; restart T3 Code. |

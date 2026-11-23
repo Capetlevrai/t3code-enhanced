@@ -4,7 +4,8 @@
 .DESCRIPTION
     T3 Code n'a pas de pilote Oh My Pi. Il a un pilote "Pi" (RPC JSONL) et omp-t3
     (https://github.com/hashangit/omp-t3) adapte omp a ce pilote. Ce script :
-      1. Verifie omp ; s'il est absent ou casse, le (re)installe avec Bun (>= 1.4.4, exige par omp 19.x).
+      1. Verifie omp (>= 19.0.0, executable autonome ou paquet Bun) et previent si plusieurs omp sont
+         dans le PATH ; s'il est absent ou casse, le (re)installe avec Bun (>= 1.4.4, exige par omp 19.x).
       2. Installe omp-t3 a la version epinglee (npm -g) s'il est absent, ou si -OmpT3Version est donne.
          Un omp-t3 deja installe n'est jamais retrograde.
       3. Rend opt-in la creation automatique d'issues GitHub de omp-t3 (par defaut il utilise
@@ -57,6 +58,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $MinBun = [version]"1.4.4"
+$MinOmp = [version]"19.0.0"   # setup tested with omp 19.1.0 (Bun package and standalone omp.exe both fine)
 $VerifyError = $null
 # omp-t3 versions whose whole issue-filing path was read and checked. Another version may add a new way
 # to file issues that no pattern check can see: it is refused unless -AllowUnverifiedOmpT3.
@@ -118,6 +120,34 @@ function Get-NpmPath([string]$Npm, [string]$What, [switch]$AllowMissing) {
     $ok = ($LASTEXITCODE -eq 0 -and $path -and [System.IO.Path]::IsPathRooted($path) -and ($AllowMissing -or (Test-Path -LiteralPath $path)))
     if (-not $ok) { throw "npm $What -g a echoue ou renvoie un chemin invalide : '$path'." }
     return $path
+}
+
+function Assert-Omp {
+    # Standalone omp.exe (official installer, bundles its own runtime) and the Bun package both work;
+    # what matters is the version of the omp found first on PATH, and that no second omp competes with it.
+    $all = @(Get-Command omp -All -CommandType Application -ErrorAction SilentlyContinue |
+        ForEach-Object { [System.IO.Path]::GetFullPath($_.Source) } | Select-Object -Unique)
+    if ($all.Count -eq 0) { throw "omp est introuvable dans le PATH." }
+    $first = $all[0]
+    $r = Invoke-Native $first @("--version")
+    $m = [regex]::Match($r.Output, 'omp/(\d+\.\d+\.\d+)')
+    if ($r.Code -ne 0 -or -not $m.Success) { throw "omp ($first) ne repond pas a --version : $($r.Output)" }
+    $ver = [version]$m.Groups[1].Value
+    $kind = if ($first -match '\\\.bun\\') { "paquet Bun" } else { "executable autonome" }
+    $standalone = Join-Path $env:LOCALAPPDATA "omp\omp.exe"
+    $others = @($all | Select-Object -Skip 1)
+    if ((Test-Path -LiteralPath $standalone) -and -not ($all -contains [System.IO.Path]::GetFullPath($standalone))) {
+        $others += "$standalone (hors du PATH)"
+    }
+    if ($others.Count -gt 0) {
+        Write-Warning ("Plusieurs omp sur ce PC. T3 Code lancera le premier du PATH : $first ($kind, $ver). Autre(s) : " + ($others -join " ; ") +
+            ". Gardez-en un seul (supprimez l'autre ou retirez son dossier du PATH) pour eviter les surprises apres une mise a jour.")
+    }
+    if ($ver -lt $MinOmp) {
+        $how = if ($kind -eq "paquet Bun") { "bun install -g @oh-my-pi/pi-coding-agent (Bun >= $MinBun)" } else { "omp update" }
+        throw "omp $ver ($kind, $first) est trop ancien : $MinOmp minimum, teste avec 19.1.0. Mettez-le a jour avec : $how, puis relancez."
+    }
+    Write-Host "[OK] omp $ver ($kind : $first)" -ForegroundColor Green
 }
 
 function Get-BunVersion([string]$Bun) {
@@ -184,8 +214,6 @@ if (-not $Remove) {
             $omp = Get-CommandPath "omp"
             if (-not $omp) { throw "omp reste introuvable apres installation (PATH ?)." }
         }
-        Write-Host "[OK] $((Invoke-Native $omp @('--version')).Output) ($omp)" -ForegroundColor Green
-
         # Never downgrade an installed omp-t3 unless a version was asked for explicitly.
         $installedPkg = Join-Path (Get-NpmPath $npm "root" -AllowMissing) "omp-t3\package.json"
         $installedVer = $null
@@ -200,6 +228,9 @@ if (-not $Remove) {
             Write-Host "[OK] omp-t3@$OmpT3Version installe" -ForegroundColor Green
         }
     }
+
+    # omp itself, in both modes: omp-t3 launches the FIRST omp on PATH, so check that one.
+    Assert-Omp
 
     # The package and its launcher must come from the SAME npm prefix (several Node installs are common).
     $npmRoot = Get-NpmPath $npm "root"
