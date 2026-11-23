@@ -97,13 +97,15 @@ function Write-FileAtomic([string]$Path, [string]$Content, [string]$Backup) {
     }
 }
 
-function Get-NpmPath([string]$Npm, [string]$What) {
+function Get-NpmPath([string]$Npm, [string]$What, [switch]$AllowMissing) {
     # stdout only: npm warnings on stderr must not end up in the path.
     $prev = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try { $lines = @(& $Npm $What "-g" 2>$null) } finally { $ErrorActionPreference = $prev }
     $path = @($lines | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) | Select-Object -Last 1
-    if ($LASTEXITCODE -ne 0 -or -not $path -or -not (Test-Path -LiteralPath $path)) { throw "npm $What -g a echoue ou renvoie un chemin invalide : '$path'." }
+    # Before the first global install, `npm root -g` can name a folder that does not exist yet.
+    $ok = ($LASTEXITCODE -eq 0 -and $path -and [System.IO.Path]::IsPathRooted($path) -and ($AllowMissing -or (Test-Path -LiteralPath $path)))
+    if (-not $ok) { throw "npm $What -g a echoue ou renvoie un chemin invalide : '$path'." }
     return $path
 }
 
@@ -133,7 +135,13 @@ function Test-IsOmpT3Instance($Instance) {
     $cfg = $Instance.PSObject.Properties["config"]
     if ($null -eq $cfg -or $null -eq $cfg.Value) { return $false }
     $bp = $cfg.Value.PSObject.Properties["binaryPath"]
-    return ($null -ne $bp -and [string]$bp.Value -match 'omp-t3(\.cmd)?$')
+    return ($null -ne $bp -and (Test-IsOmpT3Launcher ([string]$bp.Value)))
+}
+
+function Test-IsOmpT3Launcher([string]$Path) {
+    # Whole file name, not a suffix: "custom-omp-t3.cmd" is someone else's launcher.
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    return @("omp-t3", "omp-t3.cmd") -contains [System.IO.Path]::GetFileName($Path.Trim().Trim('"')).ToLowerInvariant()
 }
 
 # ---------------------------------------------------------------- 1..4 install, patch, check
@@ -168,7 +176,7 @@ if (-not $Remove) {
         Write-Host "[OK] $((Invoke-Native $omp @('--version')).Output) ($omp)" -ForegroundColor Green
 
         # Never downgrade an installed omp-t3 unless a version was asked for explicitly.
-        $installedPkg = Join-Path (Get-NpmPath $npm "root") "omp-t3\package.json"
+        $installedPkg = Join-Path (Get-NpmPath $npm "root" -AllowMissing) "omp-t3\package.json"
         $installedVer = $null
         if (Test-Path -LiteralPath $installedPkg) { $installedVer = ([System.IO.File]::ReadAllText($installedPkg, $utf8NoBom) | ConvertFrom-Json).version }
         if ($installedVer -and -not $PSBoundParameters.ContainsKey("OmpT3Version")) {
@@ -199,10 +207,16 @@ if (-not $Remove) {
     $src = [System.IO.File]::ReadAllText($doctorJs, $utf8NoBom)
     $patched = $src.Replace($PatchOld, $PatchNew)
     $defaults = [regex]::Matches($patched, 'this\.issuesEnabled\s*=[^;]*;')
-    # No call site may force it on, in any shipped JS file.
-    $forcedOn = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -File -Include *.js, *.cjs, *.mjs -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\node_modules\\|\\test\\' } |
-        Select-String -Pattern 'issuesEnabled\s*:\s*true' -List)
+    # No call site may force it on, in any shipped JS file. Filter on the path RELATIVE to the package:
+    # the absolute path of a global install always contains \node_modules\.
+    $pkgFull = [System.IO.Path]::GetFullPath($pkgDir).TrimEnd('\') + '\'
+    $shipped = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -File -Include *.js, *.cjs, *.mjs -ErrorAction Stop |
+        Where-Object { $_.FullName.Substring($pkgFull.Length) -notmatch '^(node_modules|test|tests)\\|\\(node_modules|test|tests)\\' })
+    $forcedOn = @($shipped | Where-Object { $_.FullName -ne [System.IO.Path]::GetFullPath($doctorJs) } |
+        Select-String -Pattern 'issuesEnabled\s*:\s*(true|!0|1)\b' -List)
+    if ($shipped.Count -eq 0 -or @($shipped | Where-Object { $_.Name -eq 'proxy.js' }).Count -eq 0) {
+        throw "omp-t3 : aucun fichier source examine ($pkgDir). Fournisseur NON active."
+    }
     if ($defaults.Count -ne 1 -or $defaults[0].Value -ne $PatchNew -or $forcedOn.Count -gt 0) {
         throw "omp-t3 a change : impossible de verifier que les issues GitHub automatiques sont coupees (src/doctor.js). Fournisseur NON active ; verifiez src/doctor.js et src/proxy.js."
     }
@@ -266,6 +280,14 @@ if ($Remove) {
 } else {
     if ($null -ne $existing -and $existing.Value.driver -ne "pi") {
         throw "L'instance '$InstanceId' existe deja avec le pilote '$($existing.Value.driver)'. Choisissez un autre -InstanceId."
+    }
+    if ($null -ne $existing) {
+        # A Pi instance pointing at another launcher (upstream pi, a custom wrapper) is not ours to convert.
+        $cfgProp = $existing.Value.PSObject.Properties["config"]
+        $bpProp = if ($null -ne $cfgProp -and $null -ne $cfgProp.Value) { $cfgProp.Value.PSObject.Properties["binaryPath"] } else { $null }
+        if ($null -ne $bpProp -and -not [string]::IsNullOrWhiteSpace([string]$bpProp.Value) -and -not (Test-IsOmpT3Launcher ([string]$bpProp.Value))) {
+            throw "L'instance '$InstanceId' est une instance Pi qui lance '$($bpProp.Value)'. Choisissez un autre -InstanceId."
+        }
     }
     if ($null -eq $existing) {
         $instance = [pscustomobject]@{ driver = "pi"; displayName = $DisplayName; enabled = $true; config = [pscustomobject]@{} }

@@ -43,7 +43,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 -Favori
 
 ### `/recap` before switching provider
 
-When a thread switches provider, T3 Code hands the next model only an excerpt of the thread, and it always keeps the **last answer** first. `/recap` makes that last answer a compact hand-off note, so it reaches the next model intact.
+When a thread switches provider, T3 Code hands the next model only an excerpt of the thread, and it tries to keep the **last answer** first. `/recap` makes that last answer a compact hand-off note, so it usually reaches the next model intact. It is not a guarantee: if the target model has almost no free context, T3 Code can drop it too (the next model is then told to re-read the thread).
 
 1. Type `/recap` in the current conversation (optionally `/recap <point to focus on>`).
 2. The model replies with a recap of at most 25 lines and no logs: goal, decisions, what's done (files, commits, tests), next steps, open questions, where to find details. It makes no tool calls.
@@ -57,9 +57,9 @@ When a thread switches provider, T3 Code hands the next model only an excerpt of
 | Codex | Global rule in `~/.codex/AGENTS.md` recognises `/recap` | ✅ |
 | Antigravity / Gemini | Global rule in `~/.gemini/GEMINI.md` (T3 Code copies it into its Antigravity profile) | ✅ |
 
-Use it on long threads. On short ones, or when switching back to a provider that already took part (it keeps its own memory), it is not needed. `/compact` is **not** a substitute: a compaction summary is not among the items T3 Code passes on a handoff.
+Use it on long threads. On short ones it is not needed. When switching back to a provider that already took part, it keeps its own memory but only gets what happened since its last turn, so `/recap` still helps if important decisions were made meanwhile. `/compact` is **not** a substitute: a compaction summary is not among the items T3 Code passes on a handoff.
 
-`improve-handoff.ps1` never overwrites a `recap.md` it did not create, and `-Undo` removes only what it installed.
+`improve-handoff.ps1` never overwrites a `recap.md` it did not create. It records what it changed in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` puts back the previous value of the variable (or removes it if there was none), removes only its own blocks and files, and leaves alone anything you changed since.
 
 ## How It Works
 

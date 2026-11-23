@@ -104,30 +104,63 @@ function Get-RuleTargets {
     )
 }
 
+$utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)   # throws on invalid UTF-8
+
 function Write-FileAtomic([string]$Path, [string]$Content) {
     $tmp = "$Path.tmp.$([guid]::NewGuid().ToString('N'))"
     try {
         [System.IO.File]::WriteAllText($tmp, $Content, $utf8NoBom)
-        if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, "$Path.bak") }
+        if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, "$Path.t3e.bak") }
         else { [System.IO.File]::Move($tmp, $Path) }
     } finally {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
 }
 
+# What this script changed, so -Undo only reverts its own work (original env value, files it created).
+$StatePath = Join-Path $env:LOCALAPPDATA "t3code-enhanced\improve-handoff.json"
+function Read-State {
+    if (Test-Path -LiteralPath $StatePath) {
+        $s = [System.IO.File]::ReadAllText($StatePath, $utf8NoBom) | ConvertFrom-Json
+        if ($null -eq $s.PSObject.Properties["createdFiles"]) { $s | Add-Member -NotePropertyName createdFiles -NotePropertyValue @() }
+        return $s
+    }
+    return [pscustomobject]@{ envRecorded = $false; envExisted = $false; envOriginal = $null; createdFiles = @() }
+}
+function Save-State($State) {
+    $dir = Split-Path -Parent $StatePath
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    $State.createdFiles = @($State.createdFiles | Select-Object -Unique)
+    Write-FileAtomic $StatePath (($State | ConvertTo-Json -Depth 5) + "`n")
+}
+$state = Read-State
+
 # ---------------------------------------------------------------- 1. environment variable
 if (-not $SkipEnv) {
     $current = [Environment]::GetEnvironmentVariable($EnvName, "User")
     if ($Undo) {
-        if ($null -ne $current) {
-            [Environment]::SetEnvironmentVariable($EnvName, $null, "User")
-            Write-Host "[OK] $EnvName retiree (retour au defaut de T3 Code : 16000)." -ForegroundColor Yellow
+        if (-not $state.envRecorded) {
+            Write-Host "[OK] $EnvName non modifiee par ce script : laissee telle quelle ($(if ($null -eq $current) { 'absente' } else { $current }))." -ForegroundColor Cyan
+        } elseif ($current -ne $EnvValue) {
+            Write-Warning "$EnvName vaut '$current' : modifiee depuis l'installation, laissee telle quelle."
+            $state.envRecorded = $false; Save-State $state
         } else {
-            Write-Host "[OK] $EnvName deja absente." -ForegroundColor Cyan
+            if ($state.envExisted) {
+                [Environment]::SetEnvironmentVariable($EnvName, [string]$state.envOriginal, "User")
+                Write-Host "[OK] $EnvName remise a sa valeur d'origine ($($state.envOriginal))." -ForegroundColor Yellow
+            } else {
+                [Environment]::SetEnvironmentVariable($EnvName, $null, "User")
+                Write-Host "[OK] $EnvName retiree (retour au defaut de T3 Code : 16000)." -ForegroundColor Yellow
+            }
+            $state.envRecorded = $false; Save-State $state
         }
     } elseif ($current -eq $EnvValue) {
         Write-Host "[OK] $EnvName deja a $EnvValue." -ForegroundColor Cyan
     } else {
+        if (-not $state.envRecorded) {
+            $state.envRecorded = $true; $state.envExisted = ($null -ne $current); $state.envOriginal = $current
+            Save-State $state
+        }
         [Environment]::SetEnvironmentVariable($EnvName, $EnvValue, "User")
         $was = if ($null -eq $current) { "defaut 16000" } else { $current }
         Write-Host "[OK] $EnvName = $EnvValue (avant : $was)." -ForegroundColor Green
@@ -140,7 +173,9 @@ if (-not $SkipEnv) {
 
 # ---------------------------------------------------------------- 2. agent rules
 if (-not $SkipRules) {
-    $pattern = '(?s)\r?\n?' + [regex]::Escape($Start) + '.*?' + [regex]::Escape($End) + '\r?\n?'
+    $inner = [regex]::Escape($Start) + '.*?' + [regex]::Escape($End)
+    # The block is always written as <newline><block>[<newline>], so removing exactly that restores the file.
+    $whole = '(?s)(?:\r?\n|^)' + $inner + '(?:\r?\n)?'
     foreach ($t in Get-RuleTargets) {
         $dir = Split-Path -Parent $t.Path
         if (-not (Test-Path -LiteralPath $dir)) {
@@ -148,31 +183,48 @@ if (-not $SkipRules) {
             continue
         }
         $exists = Test-Path -LiteralPath $t.Path
-        $text = if ($exists) { [System.IO.File]::ReadAllText($t.Path, $utf8NoBom) } else { "" }
-        if ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF) { $text = $text.Substring(1) }
+        $text = ""
+        if ($exists) {
+            try { $text = [System.IO.File]::ReadAllText($t.Path, $utf8Strict) }
+            catch {
+                Write-Warning "$($t.Agent) : $($t.Path) n'est pas en UTF-8 ; laisse intact (convertissez-le en UTF-8 puis relancez)."
+                continue
+            }
+        }
+        $hadBom = ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF)
+        if ($hadBom) { $text = $text.Substring(1) }
         $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
         $block = ($Start + "`n" + $Rule.Trim() + "`n" + $End) -replace "`r?`n", $nl
-        $hasBlock = [regex]::IsMatch($text, $pattern)
+        $hasBlock = [regex]::IsMatch($text, '(?s)' + $inner)
+        $created = @($state.createdFiles) -contains $t.Path
 
         if ($Undo) {
             if (-not $hasBlock) { Write-Host "[OK] $($t.Agent) : aucune consigne a retirer." -ForegroundColor Cyan; continue }
-            $new = [regex]::Replace($text, $pattern, $nl).TrimEnd()
-            if ($new.Length -gt 0) { $new += $nl }
+            $new = ([regex]$whole).Replace($text, "", 1)
+            if ($created -and $new.Trim().Length -eq 0) {
+                Remove-Item -LiteralPath $t.Path -Force
+                $state.createdFiles = @($state.createdFiles | Where-Object { $_ -ne $t.Path }); Save-State $state
+                Write-Host "[OK] $($t.Agent) : consigne retiree, fichier cree par ce script supprime ($($t.Path))." -ForegroundColor Yellow
+                continue
+            }
+        } elseif ($hasBlock) {
+            # Update in place: only the text between the markers changes.
+            $evaluator = [System.Text.RegularExpressions.MatchEvaluator] { param($m) $block }
+            $new = ([regex]('(?s)' + $inner)).Replace($text, $evaluator, 1)
+        } elseif ($text.Length -eq 0) {
+            $new = $block + $nl
+        } elseif ($text.EndsWith("`n")) {
+            $new = $text + $nl + $block + $nl
         } else {
-            $base = if ($hasBlock) { [regex]::Replace($text, $pattern, $nl) } else { $text }
-            $base = $base.TrimEnd()
-            $new = if ($base.Length -gt 0) { $base + $nl + $nl + $block + $nl } else { $block + $nl }
+            $new = $text + $nl + $block
         }
 
         if ($new -eq $text) {
             Write-Host "[OK] $($t.Agent) : consigne deja a jour ($($t.Path))." -ForegroundColor Cyan
             continue
         }
-        if ($Undo -and $new.Length -eq 0 -and $exists) {
-            Remove-Item -LiteralPath $t.Path -Force
-            Write-Host "[OK] $($t.Agent) : consigne retiree, fichier vide supprime ($($t.Path))." -ForegroundColor Yellow
-            continue
-        }
+        if ($hadBom) { $new = [string][char]0xFEFF + $new }
+        if (-not $exists) { $state.createdFiles = @($state.createdFiles) + $t.Path; Save-State $state }
         Write-FileAtomic $t.Path $new
         $verb = if ($Undo) { "retiree" } elseif ($hasBlock) { "mise a jour" } else { "ajoutee" }
         Write-Host "[OK] $($t.Agent) : consigne $verb ($($t.Path))." -ForegroundColor Green
