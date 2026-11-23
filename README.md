@@ -59,7 +59,7 @@ When a thread switches provider, T3 Code hands the next model only an excerpt of
 
 Use it on long threads. On short ones it is not needed. When switching back to a provider that already took part, it keeps its own memory but only gets what happened since its last turn, so `/recap` still helps if important decisions were made meanwhile. `/compact` is **not** a substitute: a compaction summary is not among the items T3 Code passes on a handoff.
 
-`improve-handoff.ps1` never overwrites a `recap.md` it did not create. It records what it changed in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` puts back the previous value of the variable (or removes it if there was none), removes only its own blocks and files, and leaves alone anything you changed since.
+`improve-handoff.ps1` never overwrites a `recap.md` it did not create; it recognises its own by the `<!-- t3code-enhanced:recap -->` line. If you customise `recap.md`, delete that line, otherwise a re-run replaces your version and `-Undo` removes it. It records what it changed in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` puts back the previous value of the variable (or removes it if there was none), removes only its own blocks and files, and leaves alone anything you changed since.
 
 ## How It Works
 

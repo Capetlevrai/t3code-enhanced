@@ -216,8 +216,13 @@ if (-not $Remove) {
         (@('.js', '.cjs', '.mjs') -contains $_.Extension.ToLowerInvariant() -or $rel -match '^bin\\[^\\.]+$') -and
         $rel -notmatch '^(node_modules|test|tests)\\|\\(node_modules|test|tests)\\'
     })
-    $forcedOn = @($shipped | Where-Object { $_.FullName -ne [System.IO.Path]::GetFullPath($doctorJs) } |
-        Select-String -Pattern 'issuesEnabled\s*:\s*(true|!0|1)\b' -List)
+    # Whole-file match (\s spans newlines), and doctor.js checked in its patched form like the others.
+    $forcedRx = [regex]'issuesEnabled\s*:\s*(true|!0|1)\b'
+    $doctorFull = [System.IO.Path]::GetFullPath($doctorJs)
+    $forcedOn = @($shipped | Where-Object {
+        $body = if ($_.FullName -eq $doctorFull) { $patched } else { [System.IO.File]::ReadAllText($_.FullName) }
+        $forcedRx.IsMatch($body)
+    })
     if ($shipped.Count -eq 0 -or @($shipped | Where-Object { $_.Name -eq 'proxy.js' }).Count -eq 0) {
         throw "omp-t3 : aucun fichier source examine ($pkgDir). Fournisseur NON active."
     }

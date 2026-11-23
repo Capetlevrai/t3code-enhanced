@@ -186,9 +186,15 @@ if (-not $SkipRules) {
     $inner = [regex]::Escape($Start) + '.*?' + [regex]::Escape($End)
     # The block is always written as <newline><block>[<newline>], so removing exactly that restores the file.
     $whole = '(?s)(?:\r?\n|^)' + $inner + '(?:\r?\n)?'
+    function Forget-Created([string]$Path) {
+        if (@($state.createdFiles) -contains $Path) {
+            $state.createdFiles = @($state.createdFiles | Where-Object { $_ -ne $Path }); Save-State $state
+        }
+    }
     foreach ($t in Get-RuleTargets) {
         $dir = Split-Path -Parent $t.Path
         if (-not (Test-Path -LiteralPath $dir)) {
+            if ($Undo) { Forget-Created $t.Path }
             Write-Host "[SKIP] $($t.Agent) : $dir absent (agent non installe)." -ForegroundColor DarkGray
             continue
         }
@@ -202,9 +208,11 @@ if (-not $SkipRules) {
             $hadBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
             $offset = if ($hadBom) { 3 } else { 0 }
             try {
-                if ($isUtf16) { throw "utf16" }
+                # NUL bytes: UTF-16 without BOM decodes as "valid" UTF-8 and would end up mixed.
+                if ($isUtf16 -or [Array]::IndexOf($bytes, [byte]0) -ge 0) { throw "utf16" }
                 $text = $utf8Strict.GetString($bytes, $offset, $bytes.Length - $offset)
             } catch {
+                if ($Undo) { Forget-Created $t.Path }
                 Write-Warning "$($t.Agent) : $($t.Path) n'est pas en UTF-8 ; laisse intact (convertissez-le en UTF-8 puis relancez)."
                 continue
             }
@@ -215,18 +223,21 @@ if (-not $SkipRules) {
         $created = @($state.createdFiles) -contains $t.Path
 
         if ($Undo) {
-            if (-not $hasBlock) { Write-Host "[OK] $($t.Agent) : aucune consigne a retirer." -ForegroundColor Cyan; continue }
+            if (-not $hasBlock) {
+                # Block already gone (removed by hand, file deleted): this file is no longer ours to delete later.
+                Forget-Created $t.Path
+                Write-Host "[OK] $($t.Agent) : aucune consigne a retirer." -ForegroundColor Cyan
+                continue
+            }
             # Block first in the file (file created by this script, user text added below): also drop the
             # blank line that separated them.
             $atStart = '(?s)^' + $inner + '(?:\r?\n){1,2}'
             $new = if ([regex]::IsMatch($text, $atStart) -and $created) { ([regex]$atStart).Replace($text, "", 1) } else { ([regex]$whole).Replace($text, "", 1) }
-            if ($created) {
-                $state.createdFiles = @($state.createdFiles | Where-Object { $_ -ne $t.Path }); Save-State $state
-                if ($new.Trim().Length -eq 0) {
-                    Remove-Item -LiteralPath $t.Path -Force
-                    Write-Host "[OK] $($t.Agent) : consigne retiree, fichier cree par ce script supprime ($($t.Path))." -ForegroundColor Yellow
-                    continue
-                }
+            if ($created -and $new.Trim().Length -eq 0) {
+                Remove-Item -LiteralPath $t.Path -Force
+                Forget-Created $t.Path
+                Write-Host "[OK] $($t.Agent) : consigne retiree, fichier cree par ce script supprime ($($t.Path))." -ForegroundColor Yellow
+                continue
             }
         } elseif ($hasBlock) {
             # Update in place: only the text between the markers changes.
@@ -247,6 +258,7 @@ if (-not $SkipRules) {
         if ($hadBom) { $new = [string][char]0xFEFF + $new }
         if (-not $exists) { $state.createdFiles = @($state.createdFiles) + $t.Path; Save-State $state }
         Write-FileAtomic $t.Path $new
+        if ($Undo) { Forget-Created $t.Path }   # kept with the user's own text: never delete it later
         $verb = if ($Undo) { "retiree" } elseif ($hasBlock) { "mise a jour" } else { "ajoutee" }
         Write-Host "[OK] $($t.Agent) : consigne $verb ($($t.Path))." -ForegroundColor Green
     }
