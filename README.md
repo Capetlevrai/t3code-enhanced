@@ -28,6 +28,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\optimize-t3code.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File .\add-defender-exclusions.ps1
 ```
 
+## Providers
+
+[`docs/PROVIDERS.md`](docs/PROVIDERS.md) covers moving OpenCode to v2, provider handoff (and its iOS limitation), and adding **Oh My Pi** through the [omp-t3](https://github.com/hashangit/omp-t3) shim:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 -Favorites "<provider>/<model>"
+```
+
 ## How It Works
 
 `install.ps1` compiles [`open-in-t3code.cs`](open-in-t3code.cs) into a tiny (~8 KB) console-free WinExe using Windows' built-in `.NET 4` compiler (`csc.exe`). Instead of spawning Electron with `ELECTRON_RUN_AS_NODE=1` on every click, it talks directly to T3 Code's control named pipe (`\\.\pipe\t3code-app-<hash>`).
@@ -56,3 +64,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\remove-defender-exclusions
 - [`install.ps1`](install.ps1) / [`uninstall.ps1`](uninstall.ps1) — Context menu installer & uninstaller (`HKCU`)
 - [`optimize-t3code.ps1`](optimize-t3code.ps1) — Disables provider update checks, cleans rotated logs, optimizes SQLite, optional autostart
 - [`add-defender-exclusions.ps1`](add-defender-exclusions.ps1) / [`remove-defender-exclusions.ps1`](remove-defender-exclusions.ps1) — Windows Defender exclusions
+- [`setup-oh-my-pi.ps1`](setup-oh-my-pi.ps1) — Oh My Pi provider via omp-t3 (Bun/omp checks, GitHub-issue opt-in patch, `settings.json` + favorites)
+- [`docs/PROVIDERS.md`](docs/PROVIDERS.md) — OpenCode v2, handoff, Oh My Pi: traps and fixes
