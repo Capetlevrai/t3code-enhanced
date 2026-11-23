@@ -210,8 +210,12 @@ if (-not $Remove) {
     # No call site may force it on, in any shipped JS file. Filter on the path RELATIVE to the package:
     # the absolute path of a global install always contains \node_modules\.
     $pkgFull = [System.IO.Path]::GetFullPath($pkgDir).TrimEnd('\') + '\'
-    $shipped = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -File -Include *.js, *.cjs, *.mjs -ErrorAction Stop |
-        Where-Object { $_.FullName.Substring($pkgFull.Length) -notmatch '^(node_modules|test|tests)\\|\\(node_modules|test|tests)\\' })
+    # No -Include: Windows PowerShell 5.1 ignores it with -LiteralPath. bin\ holds extension-less Node scripts.
+    $shipped = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -File -ErrorAction Stop | Where-Object {
+        $rel = $_.FullName.Substring($pkgFull.Length)
+        (@('.js', '.cjs', '.mjs') -contains $_.Extension.ToLowerInvariant() -or $rel -match '^bin\\[^\\.]+$') -and
+        $rel -notmatch '^(node_modules|test|tests)\\|\\(node_modules|test|tests)\\'
+    })
     $forcedOn = @($shipped | Where-Object { $_.FullName -ne [System.IO.Path]::GetFullPath($doctorJs) } |
         Select-String -Pattern 'issuesEnabled\s*:\s*(true|!0|1)\b' -List)
     if ($shipped.Count -eq 0 -or @($shipped | Where-Object { $_.Name -eq 'proxy.js' }).Count -eq 0) {
@@ -285,8 +289,14 @@ if ($Remove) {
         # A Pi instance pointing at another launcher (upstream pi, a custom wrapper) is not ours to convert.
         $cfgProp = $existing.Value.PSObject.Properties["config"]
         $bpProp = if ($null -ne $cfgProp -and $null -ne $cfgProp.Value) { $cfgProp.Value.PSObject.Properties["binaryPath"] } else { $null }
-        if ($null -ne $bpProp -and -not [string]::IsNullOrWhiteSpace([string]$bpProp.Value) -and -not (Test-IsOmpT3Launcher ([string]$bpProp.Value))) {
-            throw "L'instance '$InstanceId' est une instance Pi qui lance '$($bpProp.Value)'. Choisissez un autre -InstanceId."
+        # A top-level binaryPath (ignored by T3 Code) pointing at omp-t3 is a broken earlier attempt: migrate it.
+        $topBp = $existing.Value.PSObject.Properties["binaryPath"]
+        $isOurs = (Test-IsOmpT3Launcher $(if ($null -ne $bpProp) { [string]$bpProp.Value } else { "" })) -or
+                  ($null -eq $bpProp -and $null -ne $topBp -and (Test-IsOmpT3Launcher ([string]$topBp.Value)))
+        if (-not $isOurs) {
+            # Includes a stock Pi instance without binaryPath, which runs `pi` from PATH.
+            $what = if ($null -ne $bpProp -and -not [string]::IsNullOrWhiteSpace([string]$bpProp.Value)) { "'$($bpProp.Value)'" } else { "pi (instance Pi standard)" }
+            throw "L'instance '$InstanceId' est une instance Pi qui lance $what. Choisissez un autre -InstanceId."
         }
     }
     if ($null -eq $existing) {
@@ -296,6 +306,9 @@ if ($Remove) {
         # Merge: keep environment, accentColor, displayName and other config fields untouched.
         $instance = $existing.Value
         if ($null -eq $instance.PSObject.Properties["enabled"]) { $instance | Add-Member -NotePropertyName "enabled" -NotePropertyValue $true } else { $instance.enabled = $true }
+        if ($null -eq $instance.PSObject.Properties["displayName"] -or [string]::IsNullOrWhiteSpace([string]$instance.displayName)) {
+            $instance | Add-Member -NotePropertyName "displayName" -NotePropertyValue $DisplayName -Force
+        }
         if ($null -eq $instance.PSObject.Properties["config"] -or $null -eq $instance.config) {
             $instance | Add-Member -NotePropertyName "config" -NotePropertyValue ([pscustomobject]@{}) -Force
         }

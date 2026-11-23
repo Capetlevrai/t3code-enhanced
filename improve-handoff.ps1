@@ -91,9 +91,14 @@ argument-hint: "[point a mettre en avant]"
 ---
 '@ + "`n" + $RecapMarker + "`n`n" + $RecapFormat + "`nPrecision de l'utilisateur : `$ARGUMENTS`n"
 
+function Get-HomeDir([string]$Value, [string]$Default) {
+    if ([string]::IsNullOrWhiteSpace($Value)) { return (Join-Path $env:USERPROFILE $Default) }
+    return [System.IO.Path]::GetFullPath($Value.Trim().Trim('"'))
+}
+$claudeHome = Get-HomeDir $env:CLAUDE_CONFIG_DIR ".claude"
+$codexHome = Get-HomeDir $env:CODEX_HOME ".codex"
+
 function Get-RuleTargets {
-    $claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE ".claude" }
-    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE ".codex" }
     @(
         [pscustomobject]@{ Agent = "Claude Code"; Path = Join-Path $claudeHome "CLAUDE.md" }
         [pscustomobject]@{ Agent = "Codex"; Path = Join-Path $codexHome "AGENTS.md" }
@@ -106,11 +111,16 @@ function Get-RuleTargets {
 
 $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)   # throws on invalid UTF-8
 
-function Write-FileAtomic([string]$Path, [string]$Content) {
+function Write-FileAtomic([string]$Path, [string]$Content, [switch]$NoBackup) {
+    # Backups only for the user's own files; files this script fully owns get none.
     $tmp = "$Path.tmp.$([guid]::NewGuid().ToString('N'))"
     try {
         [System.IO.File]::WriteAllText($tmp, $Content, $utf8NoBom)
-        if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, "$Path.t3e.bak") }
+        if (Test-Path -LiteralPath $Path) {
+            # [NullString]::Value, not $null: PowerShell turns $null into "" for a .NET string argument.
+            if ($NoBackup) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+            else { [System.IO.File]::Replace($tmp, $Path, "$Path.t3e.bak") }
+        }
         else { [System.IO.File]::Move($tmp, $Path) }
     } finally {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
@@ -131,7 +141,7 @@ function Save-State($State) {
     $dir = Split-Path -Parent $StatePath
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     $State.createdFiles = @($State.createdFiles | Select-Object -Unique)
-    Write-FileAtomic $StatePath (($State | ConvertTo-Json -Depth 5) + "`n")
+    Write-FileAtomic $StatePath (($State | ConvertTo-Json -Depth 5) + "`n") -NoBackup
 }
 $state = Read-State
 
@@ -206,12 +216,17 @@ if (-not $SkipRules) {
 
         if ($Undo) {
             if (-not $hasBlock) { Write-Host "[OK] $($t.Agent) : aucune consigne a retirer." -ForegroundColor Cyan; continue }
-            $new = ([regex]$whole).Replace($text, "", 1)
-            if ($created -and $new.Trim().Length -eq 0) {
-                Remove-Item -LiteralPath $t.Path -Force
+            # Block first in the file (file created by this script, user text added below): also drop the
+            # blank line that separated them.
+            $atStart = '(?s)^' + $inner + '(?:\r?\n){1,2}'
+            $new = if ([regex]::IsMatch($text, $atStart) -and $created) { ([regex]$atStart).Replace($text, "", 1) } else { ([regex]$whole).Replace($text, "", 1) }
+            if ($created) {
                 $state.createdFiles = @($state.createdFiles | Where-Object { $_ -ne $t.Path }); Save-State $state
-                Write-Host "[OK] $($t.Agent) : consigne retiree, fichier cree par ce script supprime ($($t.Path))." -ForegroundColor Yellow
-                continue
+                if ($new.Trim().Length -eq 0) {
+                    Remove-Item -LiteralPath $t.Path -Force
+                    Write-Host "[OK] $($t.Agent) : consigne retiree, fichier cree par ce script supprime ($($t.Path))." -ForegroundColor Yellow
+                    continue
+                }
             }
         } elseif ($hasBlock) {
             # Update in place: only the text between the markers changes.
@@ -239,12 +254,19 @@ if (-not $SkipRules) {
 
 # ---------------------------------------------------------------- 3. /recap command files
 if (-not $SkipRecap) {
-    $claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $env:USERPROFILE ".claude" }
-    $recapTargets = @(
-        # omp also loads Claude Code's user commands, so this one file serves both.
-        [pscustomobject]@{ Agent = "Claude Code + omp"; Home = $claudeHome; Path = Join-Path $claudeHome "commands\recap.md" }
-        [pscustomobject]@{ Agent = "OpenCode"; Home = Join-Path $env:USERPROFILE ".config\opencode"; Path = Join-Path $env:USERPROFILE ".config\opencode\commands\recap.md" }
-    )
+    # omp loads Claude Code's user commands from ~/.claude/commands, whether or not Claude Code is installed
+    # and whatever CLAUDE_CONFIG_DIR says. One file serves both when the folders coincide.
+    $ompClaudeCommands = Join-Path $env:USERPROFILE ".claude\commands\recap.md"
+    $claudeCommands = Join-Path $claudeHome "commands\recap.md"
+    $ompInstalled = Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".omp\agent")
+    $recapTargets = @()
+    if ($claudeCommands -eq $ompClaudeCommands) {
+        $recapTargets += [pscustomobject]@{ Agent = "Claude Code + omp"; Installed = ((Test-Path -LiteralPath $claudeHome) -or $ompInstalled); Path = $claudeCommands }
+    } else {
+        $recapTargets += [pscustomobject]@{ Agent = "Claude Code"; Installed = (Test-Path -LiteralPath $claudeHome); Path = $claudeCommands }
+        $recapTargets += [pscustomobject]@{ Agent = "omp"; Installed = $ompInstalled; Path = $ompClaudeCommands }
+    }
+    $recapTargets += [pscustomobject]@{ Agent = "OpenCode"; Installed = (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".config\opencode")); Path = Join-Path $env:USERPROFILE ".config\opencode\commands\recap.md" }
     foreach ($t in $recapTargets) {
         $exists = Test-Path -LiteralPath $t.Path
         $current = if ($exists) { [System.IO.File]::ReadAllText($t.Path, $utf8NoBom) } else { $null }
@@ -262,8 +284,8 @@ if (-not $SkipRecap) {
             }
             continue
         }
-        if (-not (Test-Path -LiteralPath $t.Home)) {
-            Write-Host "[SKIP] $($t.Agent) : $($t.Home) absent (agent non installe)." -ForegroundColor DarkGray
+        if (-not $t.Installed) {
+            Write-Host "[SKIP] $($t.Agent) : agent non installe." -ForegroundColor DarkGray
             continue
         }
         $content = $RecapCommand -replace "`r?`n", "`n"
@@ -272,7 +294,7 @@ if (-not $SkipRecap) {
             continue
         }
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $t.Path) | Out-Null
-        Write-FileAtomic $t.Path $content
+        Write-FileAtomic $t.Path $content -NoBackup
         $verb = if ($ours) { "mise a jour" } else { "installee" }
         Write-Host "[OK] $($t.Agent) : commande /recap $verb ($($t.Path))." -ForegroundColor Green
     }
