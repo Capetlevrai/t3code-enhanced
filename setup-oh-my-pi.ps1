@@ -4,13 +4,14 @@
 .DESCRIPTION
     T3 Code n'a pas de pilote Oh My Pi. Il a un pilote "Pi" (RPC JSONL) et omp-t3
     (https://github.com/hashangit/omp-t3) adapte omp a ce pilote. Ce script :
-      1. Verifie Bun (>= 1.4.4, exige par omp 19.x) et omp (le reinstalle avec Bun s'il est casse).
+      1. Verifie omp ; s'il est absent ou casse, le (re)installe avec Bun (>= 1.4.4, exige par omp 19.x).
       2. Installe omp-t3 a la version epinglee (npm -g) s'il est absent, ou si -OmpT3Version est donne.
          Un omp-t3 deja installe n'est jamais retrograde.
       3. Rend opt-in la creation automatique d'issues GitHub de omp-t3 (par defaut il utilise
          votre `gh` connecte pour publier une issue publique en votre nom) en patchant la valeur par
-         defaut de src/doctor.js. Sans verification complete, le script s'arrete AVANT d'activer le
-         fournisseur. `npm update -g omp-t3` annule le patch : relancez ensuite ce script.
+         defaut de src/doctor.js. Seules les versions d'omp-t3 auditees ($AuditedOmpT3) sont acceptees.
+         Sans verification complete, le script desactive les instances Oh My Pi existantes et s'arrete.
+         Ne faites pas `npm update -g omp-t3` a l'aveugle : revenez avec -OmpT3Version 1.5.0.
       4. Lance `omp-t3 --check` avec le lanceur du meme prefixe npm que le paquet patche.
       5. Ecrit le fournisseur dans settings.json de T3 Code (cle `config`, sinon T3 ignore
          binaryPath et lance `pi`) en fusionnant avec une instance existante, plus les favoris.
@@ -29,7 +30,10 @@
     N'installe ni Bun, ni omp, ni omp-t3. Le patch des issues et `omp-t3 --check` sont quand meme
     appliques/lances sur le omp-t3 deja installe.
 .PARAMETER Force
-    Ecrit settings.json meme si T3 Code est ouvert.
+    Ecrit settings.json meme si T3 Code est ouvert. Sans lui, T3 ouvert : installation et patch faits,
+    settings.json intact, code de sortie 2.
+.PARAMETER AllowUnverifiedOmpT3
+    Accepte une version d'omp-t3 non auditee (lisez d'abord son code de creation d'issues).
 .PARAMETER Remove
     Retire l'instance (seulement si c'est bien une instance Pi pointant vers omp-t3) et ses favoris.
     Ne desinstalle rien.
@@ -44,6 +48,8 @@ param(
     [switch]$SkipInstall,
     [switch]$Force,
     [switch]$Remove,
+    # Accept an omp-t3 version whose issue-filing code has not been audited (see $AuditedOmpT3).
+    [switch]$AllowUnverifiedOmpT3,
     # `powershell -File x.ps1 -Favorites "a", "b"` delivers "b" as a stray argument: collect it as a favorite.
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$MoreFavorites = @()
@@ -52,6 +58,9 @@ param(
 $ErrorActionPreference = "Stop"
 $MinBun = [version]"1.4.4"
 $VerifyError = $null
+# omp-t3 versions whose whole issue-filing path was read and checked. Another version may add a new way
+# to file issues that no pattern check can see: it is refused unless -AllowUnverifiedOmpT3.
+$AuditedOmpT3 = @("1.5.0")
 $MaxJsonDepth = 30  # ConvertTo-Json -Depth 32 below; deeper settings would be stringified silently
 # Single default for every ContractDoctor (src/doctor.js); call sites that pass nothing get "off".
 $PatchOld = "this.issuesEnabled = options.issuesEnabled !== false;"
@@ -153,22 +162,22 @@ if (-not $Remove) {
     if (-not $npm) { throw "npm est introuvable (Node.js requis par omp-t3)." }
 
     if (-not $SkipInstall) {
-        $bun = Get-CommandPath "bun"
-        if (-not $bun) { throw "Bun est introuvable. Installez-le (https://bun.sh) puis relancez." }
-        $bunVer = Get-BunVersion $bun
-        if ($bunVer -lt $MinBun) {
-            Write-Host "[..] Bun $bunVer < $MinBun : bun upgrade" -ForegroundColor Cyan
-            $r = Invoke-Native $bun @("upgrade")
-            if ($r.Code -ne 0) { throw "bun upgrade a echoue : $($r.Output)" }
-            $bunVer = Get-BunVersion $bun
-            if ($bunVer -lt $MinBun) { throw "Bun reste en $bunVer apres bun upgrade (minimum $MinBun)." }
-        }
-        Write-Host "[OK] Bun $bunVer" -ForegroundColor Green
-
+        # A working omp is enough; Bun is only needed (and upgraded) to (re)install it.
         $omp = Get-CommandPath "omp"
         $ompOk = $false
         if ($omp) { $r = Invoke-Native $omp @("--version"); $ompOk = ($r.Code -eq 0 -and $r.Output -match 'omp/') }
         if (-not $ompOk) {
+            $bun = Get-CommandPath "bun"
+            if (-not $bun) { throw "omp est absent ou ne demarre pas, et Bun est introuvable pour l'installer. Installez Bun (https://bun.sh) puis relancez." }
+            $bunVer = Get-BunVersion $bun
+            if ($bunVer -lt $MinBun) {
+                Write-Host "[..] Bun $bunVer < $MinBun : bun upgrade" -ForegroundColor Cyan
+                $r = Invoke-Native $bun @("upgrade")
+                if ($r.Code -ne 0) { throw "bun upgrade a echoue : $($r.Output)" }
+                $bunVer = Get-BunVersion $bun
+                if ($bunVer -lt $MinBun) { throw "Bun reste en $bunVer apres bun upgrade (minimum $MinBun)." }
+            }
+            Write-Host "[OK] Bun $bunVer" -ForegroundColor Green
             Write-Host "[..] omp absent ou casse : bun install -g @oh-my-pi/pi-coding-agent" -ForegroundColor Cyan
             $r = Invoke-Native $bun @("install", "-g", "@oh-my-pi/pi-coding-agent")
             if ($r.Code -ne 0) { throw "Installation de omp echouee : $($r.Output)" }
@@ -228,7 +237,16 @@ if (-not $Remove) {
     if ($shipped.Count -eq 0 -or @($shipped | Where-Object { $_.Name -eq 'proxy.js' }).Count -eq 0) {
         throw "omp-t3 : aucun fichier source examine ($pkgDir). Fournisseur NON active."
     }
-    if ($defaults.Count -ne 1 -or $defaults[0].Value -ne $PatchNew -or $forcedOn.Count -gt 0) {
+    # Outside doctor.js, issuesEnabled may only appear in the opt-in form, and nothing else may run `gh issue create`.
+    $otherIssueCode = @($shipped | Where-Object { $_.FullName -ne $doctorFull } | Where-Object {
+        $body = [System.IO.File]::ReadAllText($_.FullName)
+        $stripped = $body.Replace("issuesEnabled: process.env.OMPT3_FILE_ISSUES === '1'", "")
+        ($stripped -match 'issuesEnabled') -or ($body -match "['""]issue['""]\s*,\s*['""]create['""]|gh\s+issue\s+create|/issues/new|api\.github\.com/repos/[^""'']*/issues")
+    })
+    $pkgVersion = ([System.IO.File]::ReadAllText((Join-Path $pkgDir "package.json"), $utf8NoBom) | ConvertFrom-Json).version
+    if (-not ($AuditedOmpT3 -contains $pkgVersion) -and -not $AllowUnverifiedOmpT3) {
+        $VerifyError = "omp-t3 $pkgVersion n'a pas ete audite (versions verifiees : $($AuditedOmpT3 -join ', ')). Revenez a omp-t3@$($AuditedOmpT3[-1]) (-OmpT3Version $($AuditedOmpT3[-1])), ou relancez avec -AllowUnverifiedOmpT3 apres avoir relu son code."
+    } elseif ($defaults.Count -ne 1 -or $defaults[0].Value -ne $PatchNew -or $forcedOn.Count -gt 0 -or $otherIssueCode.Count -gt 0) {
         # Do not stop here: an instance from an earlier run would keep launching the unverified omp-t3.
         # The settings step below disables it, then the script fails.
         $VerifyError = "omp-t3 a change : impossible de verifier que les issues GitHub automatiques sont coupees (src/doctor.js). Verifiez src/doctor.js et src/proxy.js, ou revenez a omp-t3@1.5.0 (-OmpT3Version 1.5.0)."
@@ -310,10 +328,9 @@ if ($VerifyError) {
         throw "L'instance '$InstanceId' n'est pas une instance Pi pointant vers omp-t3 ; refus de la retirer."
     } else {
         $json.providerInstances.PSObject.Properties.Remove($InstanceId)
-    }
-    if ($null -ne $existing -or @($favs | Where-Object { $_.provider -eq $InstanceId }).Count -gt 0) {
+        # Only the removed instance's favorites, matched on the exact (case-sensitive) key.
         if ($null -ne $json.PSObject.Properties["favorites"]) {
-            $json.favorites = @($favs | Where-Object { $_.provider -ne $InstanceId })
+            $json.favorites = @($favs | Where-Object { $_.provider -cne $InstanceId })
         }
     }
 } else {
@@ -365,6 +382,9 @@ if ($VerifyError) {
     }
 }
 
+if (-not $VerifyError -and -not $Remove -and $null -ne $instance -and $instance.enabled -eq $false) {
+    Write-Host "[WARN] L'instance '$InstanceId' est desactivee (par vous, ou par ce script apres un omp-t3 non verifie). Reactivez-la dans T3 Code si vous voulez l'utiliser." -ForegroundColor Yellow
+}
 $after = $json | ConvertTo-Json -Depth 32 -Compress
 if ($after -ceq $before -and ($settingsExists -or $Remove)) {
     if ($VerifyError) { throw "$VerifyError Aucune instance Oh My Pi active a desactiver." }

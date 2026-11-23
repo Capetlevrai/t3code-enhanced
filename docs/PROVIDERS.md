@@ -64,7 +64,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 `
   -Favorites "<provider>/<model>,<provider>/<other-model>"
 ```
 
-Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). If T3 Code is open without `-Force`, the script changes nothing and exits with code 2. Re-running is safe: it keeps your instance's `environment`, colour, other `config` keys and on/off state, never downgrades omp-t3, and skips the write when nothing changes. Undo with `-Remove`.
+Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). If T3 Code is open without `-Force`, the script still installs and patches omp-t3 but leaves `settings.json` untouched and exits with code 2. Re-running is safe: it keeps your instance's `environment`, colour, other `config` keys and on/off state, never downgrades omp-t3, and skips the write when nothing changes. Undo with `-Remove`.
 
 ### What does not work, and why
 
@@ -89,7 +89,7 @@ Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3
 
 2. **Bun version.** omp 19.x exits with `Bun runtime must be >= 1.4.4` on older Bun. Run `bun upgrade`, then `omp --version` should print `omp/19.x`. A failed global install can also leave `omp` pointing at a missing `dist/cli.js`: reinstall with `bun install -g @oh-my-pi/pi-coding-agent`.
 
-3. **omp-t3 can file GitHub issues as you.** When it detects a protocol drift, it runs `gh issue create` on its own repo with your logged-in `gh` (at most once a day per drift). It has no switch to turn that off. `setup-oh-my-pi.ps1` patches the default in `src/doctor.js` so this only happens with `OMPT3_FILE_ISSUES=1`, and refuses to enable the provider if it cannot verify the patch. **`npm update -g omp-t3` reverts the patch:** re-run the script afterwards (it keeps the updated version).
+3. **omp-t3 can file GitHub issues as you.** When it detects a protocol drift, it runs `gh issue create` on its own repo with your logged-in `gh` (at most once a day per drift). It has no switch to turn that off. `setup-oh-my-pi.ps1` patches the default in `src/doctor.js` so this only happens with `OMPT3_FILE_ISSUES=1`. It only trusts omp-t3 versions whose issue-filing code was audited (1.5.0 today): for any other version, or if the patch or its checks fail, it switches off existing Oh My Pi instances and stops. **Don't `npm update -g omp-t3` blindly:** a newer version is refused until it is audited (or until you read its code and pass `-AllowUnverifiedOmpT3`); go back with `-OmpT3Version 1.5.0`.
 
 4. **omp-t3 defaults change omp's behavior.** It removes omp's native `task` subagents and tells the model to delegate through T3's `delegate_task`. Delegated models must be on a built-in allowlist (`glm-5.3-flash`, `gemini-3.8-flash`, `deepseek-v4.1-flash` only) and off a denylist (`gpt-*sol*`, `*opus*`, `glm-5.3`, `glm-5.3:*`). To restore stock omp, add to the instance in `settings.json`:
 

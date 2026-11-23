@@ -100,6 +100,7 @@ function Get-HomeDir([string]$Value, [string]$Default) {
 }
 $claudeHome = Get-HomeDir $env:CLAUDE_CONFIG_DIR ".claude"
 $codexHome = Get-HomeDir $env:CODEX_HOME ".codex"
+$xdgConfig = Get-HomeDir $env:XDG_CONFIG_HOME ".config"
 
 function New-Target([string]$Agent, [string]$AgentDir, [string]$Path) {
     [pscustomobject]@{ Agent = $Agent; AgentDir = $AgentDir; Path = $Path }
@@ -109,15 +110,19 @@ function Get-RuleTargets {
     # Some agents load only ONE global instruction file, the first that exists. Creating the preferred
     # file would hide the one they read today, so write into the file actually in use instead.
     $u = $env:USERPROFILE
+    # Codex: a non-empty AGENTS.override.md replaces AGENTS.md.
+    $cxOverride = Join-Path $codexHome "AGENTS.override.md"
+    $cxCandidates = @($cxOverride, (Join-Path $codexHome "AGENTS.md"))
+    $cxPath = if ((Test-Path -LiteralPath $cxOverride) -and (Get-Item -LiteralPath $cxOverride).Length -gt 0) { $cxOverride } else { $cxCandidates[1] }
     $targets = @(
         New-Target "Claude Code" $claudeHome (Join-Path $claudeHome "CLAUDE.md")
-        New-Target "Codex" $codexHome (Join-Path $codexHome "AGENTS.md")
+        New-Target "Codex" $codexHome $cxPath
         # T3 Code copies ~/.gemini/GEMINI.md and AGENTS.md into its isolated Antigravity profile.
         New-Target "Antigravity / Gemini" (Join-Path $u ".gemini") (Join-Path $u ".gemini\GEMINI.md")
     )
 
     # OpenCode v2: ~/.config/opencode/AGENTS.md, else ~/.claude/CLAUDE.md (always ~/.claude, not CLAUDE_CONFIG_DIR).
-    $ocDir = Join-Path $u ".config\opencode"
+    $ocDir = Join-Path $xdgConfig "opencode"
     $ocOwn = Join-Path $ocDir "AGENTS.md"
     $ocClaude = Join-Path $u ".claude\CLAUDE.md"
     $ocReadsClaude = [string]::IsNullOrEmpty($env:OPENCODE_DISABLE_CLAUDE_CODE) -and [string]::IsNullOrEmpty($env:OPENCODE_DISABLE_CLAUDE_CODE_PROMPT)
@@ -134,6 +139,7 @@ function Get-RuleTargets {
 
     if ($Undo) {
         # Undo looks everywhere a block may have been written, whichever file was in use at install time.
+        foreach ($c in $cxCandidates) { $targets += New-Target "Codex" $codexHome $c }
         foreach ($c in $ocCandidates) { $targets += New-Target "OpenCode" $ocDir $c }
         foreach ($c in $ompCandidates) { $targets += New-Target "Oh My Pi (omp)" $ompDir $c }
     }
@@ -224,7 +230,7 @@ if (-not $SkipRules) {
     foreach ($t in Get-RuleTargets) {
         $key = [System.IO.Path]::GetFullPath($t.Path).ToLowerInvariant()
         if ($processed.ContainsKey($key)) {
-            if (-not $Undo) { Write-Host "[OK] $($t.Agent) : lit $($t.Path), deja traite ci-dessus." -ForegroundColor Cyan }
+            if (-not $Undo) { Write-Host "[OK] $($t.Agent) : lit $($t.Path), meme fichier que ci-dessus (voir la ligne precedente)." -ForegroundColor Cyan }
             continue
         }
         $exists = Test-Path -LiteralPath $t.Path
@@ -235,6 +241,14 @@ if (-not $SkipRules) {
             continue
         }
         $processed[$key] = $true
+        if ($exists) {
+            # A symlink or hard link (shared dotfile) would be replaced by a plain file and silently diverge.
+            $item = Get-Item -LiteralPath $t.Path -Force
+            if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or $item.LinkType -eq "HardLink") {
+                Write-Warning "$($t.Agent) : $($t.Path) est un lien ; laisse intact. Ajoutez le bloc a la main dans le fichier cible si vous le souhaitez."
+                continue
+            }
+        }
         $text = ""
         $hadBom = $false
         if ($exists) {
@@ -284,7 +298,7 @@ if (-not $SkipRules) {
                 # File created by this script, user text added below: also drop the blank line between them.
                 $after = $after -replace '\A\r?\n', ''
             }
-            if ($before.Length -gt 0 -and $after.Length -gt 0 -and -not $before.EndsWith("`n") -and -not $after.StartsWith("`n") -and -not $after.StartsWith("`r`n")) {
+            if ($before.Length -gt 0 -and $after.Length -gt 0 -and $before -notmatch '\n\z' -and $after -notmatch '\A\r?\n') {
                 $before += $nl
             }
             $new = $before + $after
@@ -300,7 +314,7 @@ if (-not $SkipRules) {
             $new = ([regex]('(?s)' + $inner)).Replace($text, $evaluator, 1)
         } elseif ($text.Length -eq 0) {
             $new = $block + $nl
-        } elseif ($text.EndsWith("`n")) {
+        } elseif ($text -match '\n\z') {   # regex, not EndsWith: culture-sensitive on .NET 5+
             $new = $text + $nl + $block + $nl
         } else {
             $new = $text + $nl + $block
@@ -323,7 +337,7 @@ if (-not $SkipRules) {
 if (-not $SkipRecap) {
     # omp reads its own ~/.omp/agent/commands (it ignores ~/.claude/commands unless commands.enableClaudeUser).
     $ompAgent = Join-Path $env:USERPROFILE ".omp\agent"
-    $openCodeHome = Join-Path $env:USERPROFILE ".config\opencode"
+    $openCodeHome = Join-Path $xdgConfig "opencode"
     $recapTargets = @(
         [pscustomobject]@{ Agent = "Claude Code"; Installed = (Test-Path -LiteralPath $claudeHome); Path = Join-Path $claudeHome "commands\recap.md" }
         [pscustomobject]@{ Agent = "Oh My Pi (omp)"; Installed = (Test-Path -LiteralPath $ompAgent); Path = Join-Path $ompAgent "commands\recap.md" }
