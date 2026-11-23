@@ -23,6 +23,34 @@ T3 Code can hand a thread over to another provider (Claude → OpenCode → Clau
 - **Desktop:** works with OpenCode both ways. Every bundled adapter reports `supportsProviderSwitchingViaHandoff: true`.
 - **iOS app:** once an OpenCode turn has run in a thread, *Thread settings* only lists OpenCode. The server still allows the switch, so the iOS app is the one hiding the other providers. Workaround: switch provider from the desktop app, or start a new thread on the phone.
 
+### What the target model actually receives
+
+The handoff is **not** the whole thread. The target model gets one bounded excerpt (`packages/provider-core/src/server/handoffBudget.ts` in T3 Code 0.1.11):
+
+- **Size:** `min(T3CODE_CONTEXT_HANDOFF_TOKEN_CAP, 64000, free room in the target model)`. Despite its name, the cap is compared to **bytes** of serialized history: the default `16000` is roughly 4k tokens, the maximum `64000` roughly 16k tokens. The free room is the model's window minus what it already holds, your new message, and a work reserve of at least a quarter of the window.
+- **Selection:** your last message, the last "assistant" item (which can be a command output or a file change, not necessarily a written answer), your first message, then newest-first until the budget is full. An item that does not fit is skipped whole; command outputs are never truncated, so a few big ones can crowd everything else out.
+- **Omitted items:** only the 20 most recent omitted ids are listed, with an instruction to fetch them with the `t3_thread_read` tool.
+- **Switching back** to a provider that already took part only sends what happened since its last turn (`delta_since_target_last_seen`). A bigger cap does not resend what an earlier handoff dropped.
+
+On a long thread (185 items, many tool outputs), the default sent 11 items and omitted 174, including the answer the next question was about.
+
+### Making handoffs more reliable
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\improve-handoff.ps1   # -Undo to revert
+```
+
+Then quit T3 Code completely and restart it. The script:
+
+1. Sets the user variable `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP=64000`, the maximum T3 Code accepts (4× the default excerpt). It is still bounded by the free room of the target model, so small models stay safe. Cost: at most ~16k extra input tokens on the turn that switches.
+2. Adds a short rule, between markers, to each installed agent's global instructions: when a handoff omitted items and the request depends on one of them, read the thread with `t3_thread_read` (`view: "messages"`, then `beforePosition`) instead of guessing. Files: `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (or `$CODEX_HOME`), `~/.gemini/GEMINI.md` (T3 Code copies it into its isolated Antigravity profile), `~/.config/opencode/AGENTS.md`, `~/.omp/agent/AGENTS.md`. The rest of each file is left untouched; `-Undo` removes only the block.
+
+Habits that help on top of it:
+
+- **Before switching**, ask the current model for a short recap (decisions, results, open point). The last assistant message is selected first, so a compact recap almost always makes it through whole.
+- **When switching to resume a precise point**, quote a distinctive sentence from the answer you mean. Your new message is never cut.
+- **Keep noisy work out of the main thread:** delegate big builds or log dumps to a sub-agent so their output does not eat the handoff budget.
+
 ## 3. Oh My Pi (omp) in T3 Code
 
 T3 Code has no Oh My Pi driver. omp is a fork of Pi, and T3 Code has a **Pi** driver (`pi --mode rpc`, JSONL over stdio), but omp does not speak it exactly. The community shim [omp-t3](https://github.com/hashangit/omp-t3) sits between them.
