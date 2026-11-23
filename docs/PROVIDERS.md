@@ -31,10 +31,10 @@ T3 Code has no Oh My Pi driver. omp is a fork of Pi, and T3 Code has a **Pi** dr
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 `
-  -Favorites "zhipuai-coding-plan/glm-5.4","refuseless/deepseek-v4.1-flash-abliterated-fast"
+  -Favorites "<provider>/<model>,<provider>/<other-model>"
 ```
 
-Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). Undo with `-Remove`.
+Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). Re-running is safe: it keeps your instance's `environment`, colour and other `config` keys, never downgrades omp-t3, and skips the write when nothing changes. Undo with `-Remove`.
 
 ### What does not work, and why
 
@@ -59,9 +59,19 @@ Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). Und
 
 2. **Bun version.** omp 19.x exits with `Bun runtime must be >= 1.4.4` on older Bun. Run `bun upgrade`, then `omp --version` should print `omp/19.x`. A failed global install can also leave `omp` pointing at a missing `dist/cli.js`: reinstall with `bun install -g @oh-my-pi/pi-coding-agent`.
 
-3. **omp-t3 can file GitHub issues as you.** When it detects a protocol drift, it runs `gh issue create` on its own repo with your logged-in `gh` (at most once a day per drift). It has no switch to turn that off. `setup-oh-my-pi.ps1` patches `src/proxy.js` so this only happens with `OMPT3_FILE_ISSUES=1`. **`npm update` reverts the patch:** re-run the script after updating omp-t3.
+3. **omp-t3 can file GitHub issues as you.** When it detects a protocol drift, it runs `gh issue create` on its own repo with your logged-in `gh` (at most once a day per drift). It has no switch to turn that off. `setup-oh-my-pi.ps1` patches the default in `src/doctor.js` so this only happens with `OMPT3_FILE_ISSUES=1`, and refuses to enable the provider if it cannot verify the patch. **`npm update -g omp-t3` reverts the patch:** re-run the script afterwards (it keeps the updated version).
 
-4. **omp-t3 defaults change omp's behavior.** It removes omp's native `task` subagents and tells the model to delegate through T3's `delegate_task`, with a built-in allow/deny list of subagent models (`*opus*` and `glm-5.3` are denied by default). To restore stock omp, set these in the instance's `environment`: `OMPT3_DELEGATE_TASKS=0`, `OMPT3_SUBAGENT_ALLOWED_MODELS=""`, `OMPT3_SUBAGENT_DISALLOWED_MODELS=""`.
+4. **omp-t3 defaults change omp's behavior.** It removes omp's native `task` subagents and tells the model to delegate through T3's `delegate_task`. Delegated models must be on a built-in allowlist (`glm-5.3-flash`, `gemini-3.8-flash`, `deepseek-v4.1-flash` only) and off a denylist (`gpt-*sol*`, `*opus*`, `glm-5.3`, `glm-5.3:*`). To restore stock omp, add to the instance in `settings.json`:
+
+   ```json
+   "environment": {
+     "OMPT3_DELEGATE_TASKS": "0",
+     "OMPT3_SUBAGENT_ALLOWED_MODELS": "",
+     "OMPT3_SUBAGENT_DISALLOWED_MODELS": ""
+   }
+   ```
+
+   The two lists must be truly empty (blank in T3 Code's settings UI). Typing `""` into the UI field makes `""` a pattern that matches no model, which blocks every delegation.
 
 5. **Sessions junction.** `omp-t3 --check` creates `~\.pi\agent\sessions` → `~\.omp\agent\sessions` (so T3's usage view sees omp sessions). It never replaces an existing folder, but if you also use upstream Pi, its new sessions now land in omp's folder.
 
@@ -93,7 +103,7 @@ Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). Und
 ### Check it works
 
 ```powershell
-omp-t3 --check        # all PASS
+omp-t3 --check        # expect "All checks passed!"; a first-run [WARN] about extension deferral is normal
 ```
 
 In T3 Code, *Oh My Pi* should list your omp models. A one-line prompt should then answer and finish its turn (it should not stay "running").
@@ -106,4 +116,5 @@ In T3 Code, *Oh My Pi* should list your omp models. A one-line prompt should the
 | *Provider executable is not installed* (ACP) | `commandPath` is under `config`. |
 | Oh My Pi lists no models | `omp-t3 --check` reports the catalog size; `omp models ls` works in a terminal. |
 | `omp` crashes on start | `bun --version` ≥ 1.4.4. |
+| Setup stops with *omp-t3 a change* | A new omp-t3 moved the issue-filing code: check `src/doctor.js` by hand before using it. |
 | OpenCode adapter errors after an update | `opencode --version` is 2.x; restart T3 Code. |

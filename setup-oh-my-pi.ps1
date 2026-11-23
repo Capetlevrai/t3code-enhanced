@@ -5,11 +5,12 @@
     T3 Code n'a pas de pilote Oh My Pi. Il a un pilote "Pi" (RPC JSONL) et omp-t3
     (https://github.com/hashangit/omp-t3) adapte omp a ce pilote. Ce script :
       1. Verifie Bun (>= 1.4.4, exige par omp 19.x) et omp (le reinstalle avec Bun s'il est casse).
-      2. Installe omp-t3 a la version epinglee (npm -g).
+      2. Installe omp-t3 a la version epinglee (npm -g) s'il est absent, ou si -OmpT3Version est donne.
+         Un omp-t3 deja installe n'est jamais retrograde.
       3. Rend opt-in la creation automatique d'issues GitHub de omp-t3 (par defaut il utilise
-         votre `gh` connecte pour publier une issue publique en votre nom). Chaque constructeur
-         ContractDoctor est verifie ; sans verification complete, le script s'arrete AVANT
-         d'activer le fournisseur. A reappliquer apres chaque mise a jour de omp-t3 : relancez ce script.
+         votre `gh` connecte pour publier une issue publique en votre nom) en patchant la valeur par
+         defaut de src/doctor.js. Sans verification complete, le script s'arrete AVANT d'activer le
+         fournisseur. `npm update -g omp-t3` annule le patch : relancez ensuite ce script.
       4. Lance `omp-t3 --check` avec le lanceur du meme prefixe npm que le paquet patche.
       5. Ecrit le fournisseur dans settings.json de T3 Code (cle `config`, sinon T3 ignore
          binaryPath et lance `pi`) en fusionnant avec une instance existante, plus les favoris.
@@ -22,7 +23,8 @@
 .PARAMETER Favorites
     Modeles a mettre en favoris, au format <fournisseur omp>/<id modele> (voir `omp models ls`).
 .PARAMETER OmpT3Version
-    Version de omp-t3 a installer (defaut : 1.5.0, testee avec omp 19.1.0 et T3 Code 0.1.11).
+    Version de omp-t3 a installer quand il est absent (defaut : 1.5.0, testee avec omp 19.1.0 et
+    T3 Code 0.1.11). Donnee explicitement, elle est installee meme si une autre version est presente.
 .PARAMETER SkipInstall
     N'installe ni Bun, ni omp, ni omp-t3. Le patch des issues et `omp-t3 --check` sont quand meme
     appliques/lances sur le omp-t3 deja installe.
@@ -50,8 +52,9 @@ param(
 $ErrorActionPreference = "Stop"
 $MinBun = [version]"1.4.4"
 $MaxJsonDepth = 30   # ConvertTo-Json -Depth 32 below; deeper settings would be stringified silently
-$PatchOld = "new ContractDoctor({ shimVersion: pkg.version })"
-$PatchNew = "new ContractDoctor({ shimVersion: pkg.version, issuesEnabled: process.env.OMPT3_FILE_ISSUES === '1' })"
+# Single default for every ContractDoctor (src/doctor.js); call sites that pass nothing get "off".
+$PatchOld = "this.issuesEnabled = options.issuesEnabled !== false;"
+$PatchNew = "this.issuesEnabled = options.issuesEnabled === true || (options.issuesEnabled !== false && process.env.OMPT3_FILE_ISSUES === '1');"
 
 if ($InstanceId -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { throw "InstanceId invalide : $InstanceId" }
 
@@ -94,6 +97,23 @@ function Write-FileAtomic([string]$Path, [string]$Content, [string]$Backup) {
     }
 }
 
+function Get-NpmPath([string]$Npm, [string]$What) {
+    # stdout only: npm warnings on stderr must not end up in the path.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try { $lines = @(& $Npm $What "-g" 2>$null) } finally { $ErrorActionPreference = $prev }
+    $path = @($lines | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) | Select-Object -Last 1
+    if ($LASTEXITCODE -ne 0 -or -not $path -or -not (Test-Path -LiteralPath $path)) { throw "npm $What -g a echoue ou renvoie un chemin invalide : '$path'." }
+    return $path
+}
+
+function Get-BunVersion([string]$Bun) {
+    $r = Invoke-Native $Bun @("--version")
+    $m = [regex]::Match($r.Output, '\d+\.\d+\.\d+')
+    if ($r.Code -ne 0 -or -not $m.Success) { throw "bun --version a echoue : $($r.Output)" }
+    return [version]$m.Value
+}
+
 function Get-JsonDepth($Node) {
     if ($Node -is [System.Management.Automation.PSCustomObject]) {
         $max = 0
@@ -125,13 +145,15 @@ if (-not $Remove) {
     if (-not $SkipInstall) {
         $bun = Get-CommandPath "bun"
         if (-not $bun) { throw "Bun est introuvable. Installez-le (https://bun.sh) puis relancez." }
-        $bunVer = [version]((Invoke-Native $bun @("--version")).Output -replace '[^0-9.].*$', '')
+        $bunVer = Get-BunVersion $bun
         if ($bunVer -lt $MinBun) {
             Write-Host "[..] Bun $bunVer < $MinBun : bun upgrade" -ForegroundColor Cyan
             $r = Invoke-Native $bun @("upgrade")
             if ($r.Code -ne 0) { throw "bun upgrade a echoue : $($r.Output)" }
+            $bunVer = Get-BunVersion $bun
+            if ($bunVer -lt $MinBun) { throw "Bun reste en $bunVer apres bun upgrade (minimum $MinBun)." }
         }
-        Write-Host "[OK] Bun $((Invoke-Native $bun @('--version')).Output)" -ForegroundColor Green
+        Write-Host "[OK] Bun $bunVer" -ForegroundColor Green
 
         $omp = Get-CommandPath "omp"
         $ompOk = $false
@@ -145,38 +167,50 @@ if (-not $Remove) {
         }
         Write-Host "[OK] $((Invoke-Native $omp @('--version')).Output) ($omp)" -ForegroundColor Green
 
-        $r = Invoke-Native $npm @("install", "-g", "omp-t3@$OmpT3Version")
-        if ($r.Code -ne 0) { throw "npm install -g omp-t3@$OmpT3Version a echoue : $($r.Output)" }
-        Write-Host "[OK] omp-t3@$OmpT3Version installe" -ForegroundColor Green
+        # Never downgrade an installed omp-t3 unless a version was asked for explicitly.
+        $installedPkg = Join-Path (Get-NpmPath $npm "root") "omp-t3\package.json"
+        $installedVer = $null
+        if (Test-Path -LiteralPath $installedPkg) { $installedVer = ([System.IO.File]::ReadAllText($installedPkg, $utf8NoBom) | ConvertFrom-Json).version }
+        if ($installedVer -and -not $PSBoundParameters.ContainsKey("OmpT3Version")) {
+            Write-Host "[OK] omp-t3 $installedVer deja installe (conserve ; -OmpT3Version pour changer)." -ForegroundColor Cyan
+        } elseif ($installedVer -eq $OmpT3Version) {
+            Write-Host "[OK] omp-t3 $installedVer deja installe." -ForegroundColor Cyan
+        } else {
+            $r = Invoke-Native $npm @("install", "-g", "omp-t3@$OmpT3Version")
+            if ($r.Code -ne 0) { throw "npm install -g omp-t3@$OmpT3Version a echoue : $($r.Output)" }
+            Write-Host "[OK] omp-t3@$OmpT3Version installe" -ForegroundColor Green
+        }
     }
 
     # The package and its launcher must come from the SAME npm prefix (several Node installs are common).
-    $npmRoot = (Invoke-Native $npm @("root", "-g")).Output
-    $npmPrefix = (Invoke-Native $npm @("prefix", "-g")).Output
+    $npmRoot = Get-NpmPath $npm "root"
+    $npmPrefix = Get-NpmPath $npm "prefix"
     $pkgDir = Join-Path $npmRoot "omp-t3"
-    $proxyJs = Join-Path $pkgDir "src\proxy.js"
+    $doctorJs = Join-Path $pkgDir "src\doctor.js"
     $ompT3Cmd = Join-Path $npmPrefix "omp-t3.cmd"
-    if (-not (Test-Path -LiteralPath $proxyJs)) { throw "omp-t3 introuvable ($pkgDir). Relancez sans -SkipInstall." }
+    if (-not (Test-Path -LiteralPath $doctorJs)) { throw "omp-t3 introuvable ($pkgDir). Relancez sans -SkipInstall." }
     if (-not (Test-Path -LiteralPath $ompT3Cmd)) { throw "Lanceur introuvable : $ompT3Cmd (prefixe npm $npmPrefix)." }
     $onPath = Get-CommandPath "omp-t3.cmd"
     if ($onPath -and ([System.IO.Path]::GetFullPath($onPath) -ne [System.IO.Path]::GetFullPath($ompT3Cmd))) {
         Write-Warning "Un autre omp-t3 passe avant dans le PATH ($onPath). T3 Code utilisera $ompT3Cmd."
     }
 
-    # Patch: issue filing becomes opt-in (OMPT3_FILE_ISSUES=1). Every constructor must be patched.
-    $src = [System.IO.File]::ReadAllText($proxyJs, $utf8NoBom)
-    $ctorPattern = 'new ContractDoctor\(\{[^}]*\}\)'
+    # Patch: issue filing becomes opt-in (OMPT3_FILE_ISSUES=1) at its single default in src/doctor.js.
+    $src = [System.IO.File]::ReadAllText($doctorJs, $utf8NoBom)
     $patched = $src.Replace($PatchOld, $PatchNew)
-    $ctors = [regex]::Matches($patched, $ctorPattern)
-    $unsafe = @($ctors | Where-Object { $_.Value -notmatch "issuesEnabled: process\.env\.OMPT3_FILE_ISSUES === '1'" })
-    if ($ctors.Count -eq 0 -or $unsafe.Count -gt 0 -or $patched -match 'new ContractDoctor\((?!\{)') {
-        throw "omp-t3 a change : impossible de couper les issues GitHub automatiques ($($unsafe.Count)/$($ctors.Count) constructeur(s) non verifie(s)). Fournisseur NON active ; verifiez src/proxy.js et src/doctor.js."
+    $defaults = [regex]::Matches($patched, 'this\.issuesEnabled\s*=[^;]*;')
+    # No call site may force it on, in any shipped JS file.
+    $forcedOn = @(Get-ChildItem -LiteralPath $pkgDir -Recurse -File -Include *.js, *.cjs, *.mjs -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch '\\node_modules\\|\\test\\' } |
+        Select-String -Pattern 'issuesEnabled\s*:\s*true' -List)
+    if ($defaults.Count -ne 1 -or $defaults[0].Value -ne $PatchNew -or $forcedOn.Count -gt 0) {
+        throw "omp-t3 a change : impossible de verifier que les issues GitHub automatiques sont coupees (src/doctor.js). Fournisseur NON active ; verifiez src/doctor.js et src/proxy.js."
     }
     if ($patched -ne $src) {
-        Write-FileAtomic $proxyJs $patched "$proxyJs.orig"
-        Write-Host "[OK] Issues GitHub automatiques desactivees ($($ctors.Count) constructeur(s) verifie(s) ; original : proxy.js.orig)." -ForegroundColor Green
+        Write-FileAtomic $doctorJs $patched "$doctorJs.orig"
+        Write-Host "[OK] Issues GitHub automatiques desactivees (opt-in OMPT3_FILE_ISSUES=1 ; original : doctor.js.orig)." -ForegroundColor Green
     } else {
-        Write-Host "[OK] Issues GitHub automatiques deja desactivees ($($ctors.Count) constructeur(s) verifie(s))." -ForegroundColor Cyan
+        Write-Host "[OK] Issues GitHub automatiques deja desactivees (opt-in OMPT3_FILE_ISSUES=1)." -ForegroundColor Cyan
     }
 
     $r = Invoke-Native $ompT3Cmd @("--check")
@@ -202,14 +236,17 @@ if ($running.Count -gt 0 -and -not $Force) {
 
 $origWriteTime = (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc
 $json = [System.IO.File]::ReadAllText($settingsPath, $utf8NoBom) | ConvertFrom-Json
+if ($null -eq $json -or $json -isnot [System.Management.Automation.PSCustomObject]) { throw "settings.json est vide ou n'est pas un objet JSON : $settingsPath" }
 $depth = Get-JsonDepth $json
 if ($depth -gt $MaxJsonDepth) { throw "settings.json est trop imbrique ($depth niveaux > $MaxJsonDepth) pour une reecriture sure sous PowerShell ; rien n'a ete modifie." }
 $before = $json | ConvertTo-Json -Depth 32 -Compress
 
-if ($null -eq $json.PSObject.Properties["providerInstances"] -or $null -eq $json.providerInstances) {
+$hasInstances = ($null -ne $json.PSObject.Properties["providerInstances"] -and $null -ne $json.providerInstances)
+if (-not $hasInstances -and -not $Remove) {
     $json | Add-Member -NotePropertyName "providerInstances" -NotePropertyValue ([pscustomobject]@{}) -Force
+    $hasInstances = $true
 }
-$existing = $json.providerInstances.PSObject.Properties[$InstanceId]
+$existing = if ($hasInstances) { $json.providerInstances.PSObject.Properties[$InstanceId] } else { $null }
 $favs = @()
 if ($null -ne $json.PSObject.Properties["favorites"]) { $favs = @($json.favorites | Where-Object { $null -ne $_ }) }
 
