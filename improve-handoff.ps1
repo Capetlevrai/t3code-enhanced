@@ -184,15 +184,21 @@ if (-not $SkipRules) {
         }
         $exists = Test-Path -LiteralPath $t.Path
         $text = ""
+        $hadBom = $false
         if ($exists) {
-            try { $text = [System.IO.File]::ReadAllText($t.Path, $utf8Strict) }
-            catch {
+            # Decode the raw bytes ourselves: ReadAllText would silently strip a BOM or accept UTF-16.
+            $bytes = [System.IO.File]::ReadAllBytes($t.Path)
+            $isUtf16 = ($bytes.Length -ge 2 -and (($bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) -or ($bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF)))
+            $hadBom = ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF)
+            $offset = if ($hadBom) { 3 } else { 0 }
+            try {
+                if ($isUtf16) { throw "utf16" }
+                $text = $utf8Strict.GetString($bytes, $offset, $bytes.Length - $offset)
+            } catch {
                 Write-Warning "$($t.Agent) : $($t.Path) n'est pas en UTF-8 ; laisse intact (convertissez-le en UTF-8 puis relancez)."
                 continue
             }
         }
-        $hadBom = ($text.Length -gt 0 -and [int]$text[0] -eq 0xFEFF)
-        if ($hadBom) { $text = $text.Substring(1) }
         $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
         $block = ($Start + "`n" + $Rule.Trim() + "`n" + $End) -replace "`r?`n", $nl
         $hasBlock = [regex]::IsMatch($text, '(?s)' + $inner)
