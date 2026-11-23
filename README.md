@@ -38,6 +38,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\add-defender-exclusions.ps
 powershell -NoProfile -ExecutionPolicy Bypass -File .\improve-handoff.ps1
 
 # Add Oh My Pi as a T3 Code provider
+# (close T3 Code first, or add -Force: T3 Code reloads settings.json live)
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 -Favorites "<provider>/<model>"
 ```
 
@@ -52,14 +53,14 @@ When a thread switches provider, T3 Code hands the next model only an excerpt of
 | Agent | How `/recap` works | Tested |
 | --- | --- | --- |
 | Claude Code | Command `~/.claude/commands/recap.md` (shows in the `/` menu) | ✅ |
-| Oh My Pi (omp) | Same file: omp loads Claude Code's user commands | ✅ |
+| Oh My Pi (omp) | Command `~/.omp/agent/commands/recap.md` | ✅ |
 | OpenCode v2 | Command `~/.config/opencode/commands/recap.md` | ✅ |
 | Codex | Global rule in `~/.codex/AGENTS.md` recognises `/recap` | ✅ |
 | Antigravity / Gemini | Global rule in `~/.gemini/GEMINI.md` (T3 Code copies it into its Antigravity profile) | ✅ |
 
 Use it on long threads. On short ones it is not needed. When switching back to a provider that already took part, it keeps its own memory but only gets what happened since its last turn, so `/recap` still helps if important decisions were made meanwhile. `/compact` is **not** a substitute: a compaction summary is not among the items T3 Code passes on a handoff.
 
-`improve-handoff.ps1` never overwrites a `recap.md` it did not create; it recognises its own by the `<!-- t3code-enhanced:recap -->` line. If you customise `recap.md`, delete that line, otherwise a re-run replaces your version and `-Undo` removes it. It records what it changed in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` puts back the previous value of the variable (or removes it if there was none), removes only its own blocks and files, and leaves alone anything you changed since.
+`improve-handoff.ps1` never overwrites a `recap.md` it did not create; it recognises its own by the `<!-- t3code-enhanced:recap -->` line. If you customise `recap.md`, delete that line, otherwise a re-run replaces your version and `-Undo` removes it. It records what it changed in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` puts back the previous value of the variable (or removes it if there was none), removes only its own blocks and files, and leaves alone anything you changed since. Before editing one of your instruction files it keeps a copy next to it (`<file>.t3e.bak`), which `-Undo` leaves in place.
 
 ## How It Works
 

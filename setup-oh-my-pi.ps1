@@ -51,7 +51,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $MinBun = [version]"1.4.4"
-$MaxJsonDepth = 30   # ConvertTo-Json -Depth 32 below; deeper settings would be stringified silently
+$VerifyError = $null
+$MaxJsonDepth = 30  # ConvertTo-Json -Depth 32 below; deeper settings would be stringified silently
 # Single default for every ContractDoctor (src/doctor.js); call sites that pass nothing get "off".
 $PatchOld = "this.issuesEnabled = options.issuesEnabled !== false;"
 $PatchNew = "this.issuesEnabled = options.issuesEnabled === true || (options.issuesEnabled !== false && process.env.OMPT3_FILE_ISSUES === '1');"
@@ -91,7 +92,8 @@ function Write-FileAtomic([string]$Path, [string]$Content, [string]$Backup) {
     $tmp = "$Path.tmp.$([guid]::NewGuid().ToString('N'))"
     try {
         [System.IO.File]::WriteAllText($tmp, $Content, $utf8NoBom)
-        [System.IO.File]::Replace($tmp, $Path, $Backup)
+        if (Test-Path -LiteralPath $Path) { [System.IO.File]::Replace($tmp, $Path, $Backup) }
+        else { [System.IO.File]::Move($tmp, $Path) }   # Replace needs an existing target
     } finally {
         if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
     }
@@ -227,15 +229,20 @@ if (-not $Remove) {
         throw "omp-t3 : aucun fichier source examine ($pkgDir). Fournisseur NON active."
     }
     if ($defaults.Count -ne 1 -or $defaults[0].Value -ne $PatchNew -or $forcedOn.Count -gt 0) {
-        throw "omp-t3 a change : impossible de verifier que les issues GitHub automatiques sont coupees (src/doctor.js). Fournisseur NON active ; verifiez src/doctor.js et src/proxy.js."
+        # Do not stop here: an instance from an earlier run would keep launching the unverified omp-t3.
+        # The settings step below disables it, then the script fails.
+        $VerifyError = "omp-t3 a change : impossible de verifier que les issues GitHub automatiques sont coupees (src/doctor.js). Verifiez src/doctor.js et src/proxy.js, ou revenez a omp-t3@1.5.0 (-OmpT3Version 1.5.0)."
     }
-    if ($patched -ne $src) {
+    if ($VerifyError) {
+        Write-Host "[ERREUR] $VerifyError" -ForegroundColor Red
+    } elseif ($patched -ne $src) {
         Write-FileAtomic $doctorJs $patched "$doctorJs.orig"
         Write-Host "[OK] Issues GitHub automatiques desactivees (opt-in OMPT3_FILE_ISSUES=1 ; original : doctor.js.orig)." -ForegroundColor Green
     } else {
         Write-Host "[OK] Issues GitHub automatiques deja desactivees (opt-in OMPT3_FILE_ISSUES=1)." -ForegroundColor Cyan
     }
 
+  if (-not $VerifyError) {
     $r = Invoke-Native $ompT3Cmd @("--check")
     # Windows PowerShell wraps native stderr in error records: keep only the message part, once.
     $warnings = @($r.Output -split "`r?`n" | Where-Object { $_ -notmatch 'CategoryInfo|FullyQualifiedErrorId' } |
@@ -247,18 +254,28 @@ if (-not $Remove) {
     }
     foreach ($w in $warnings) { Write-Host "[WARN] omp-t3 --check : $(($w -replace '^\[(WARN|FAIL)\]\s*', '').Trim())" -ForegroundColor Yellow }
     Write-Host "[OK] omp-t3 --check reussi ($ompT3Cmd)" -ForegroundColor Green
+  }
 }
 
 # ---------------------------------------------------------------- 5 settings.json
-if (-not (Test-Path -LiteralPath $settingsPath)) { throw "settings.json introuvable : $settingsPath (lancez T3 Code une fois)." }
+$settingsExists = Test-Path -LiteralPath $settingsPath
+if ($VerifyError -and -not $settingsExists) { throw $VerifyError }
 $running = @(Get-Process | Where-Object { $_.ProcessName -match '^T3 Code' })
 if ($running.Count -gt 0 -and -not $Force) {
-    Write-Host "[SKIP] settings.json non modifie : fermez T3 Code ou relancez avec -Force." -ForegroundColor Yellow
-    return
+    if ($VerifyError) { throw "$VerifyError Fermez T3 Code (ou -Force) pour que ce script desactive l'instance Oh My Pi existante." }
+    Write-Host "[SKIP] settings.json non modifie car T3 Code est ouvert : fermez-le ou relancez avec -Force." -ForegroundColor Yellow
+    exit 2
 }
 
-$origWriteTime = (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc
-$json = [System.IO.File]::ReadAllText($settingsPath, $utf8NoBom) | ConvertFrom-Json
+if ($settingsExists) {
+    $origWriteTime = (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc
+    $json = [System.IO.File]::ReadAllText($settingsPath, $utf8NoBom) | ConvertFrom-Json
+} else {
+    # T3 Code only writes settings.json once something differs from its defaults: start from an empty object.
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $settingsPath) | Out-Null
+    $origWriteTime = $null
+    $json = "{}" | ConvertFrom-Json
+}
 if ($null -eq $json -or $json -isnot [System.Management.Automation.PSCustomObject]) { throw "settings.json est vide ou n'est pas un objet JSON : $settingsPath" }
 $depth = Get-JsonDepth $json
 if ($depth -gt $MaxJsonDepth) { throw "settings.json est trop imbrique ($depth niveaux > $MaxJsonDepth) pour une reecriture sure sous PowerShell ; rien n'a ete modifie." }
@@ -275,7 +292,18 @@ if ($null -ne $existing) { $InstanceId = $existing.Name }
 $favs = @()
 if ($null -ne $json.PSObject.Properties["favorites"]) { $favs = @($json.favorites | Where-Object { $null -ne $_ }) }
 
-if ($Remove) {
+$disabled = @()
+if ($VerifyError) {
+    # Unverified omp-t3: switch off every enabled instance that launches it, then fail.
+    if ($hasInstances) {
+        foreach ($p in @($json.providerInstances.PSObject.Properties)) {
+            if ((Test-IsOmpT3Instance $p.Value) -and $p.Value.enabled -ne $false) {
+                $p.Value | Add-Member -NotePropertyName "enabled" -NotePropertyValue $false -Force
+                $disabled += $p.Name
+            }
+        }
+    }
+} elseif ($Remove) {
     if ($null -eq $existing) {
         Write-Host "[OK] Aucune instance '$InstanceId' : rien a retirer." -ForegroundColor Cyan
     } elseif (-not (Test-IsOmpT3Instance $existing.Value)) {
@@ -312,7 +340,7 @@ if ($Remove) {
     } else {
         # Merge: keep environment, accentColor, displayName and other config fields untouched.
         $instance = $existing.Value
-        if ($null -eq $instance.PSObject.Properties["enabled"]) { $instance | Add-Member -NotePropertyName "enabled" -NotePropertyValue $true } else { $instance.enabled = $true }
+        # `enabled` is left as the user set it: a re-run must not switch a disabled instance back on.
         if ($null -eq $instance.PSObject.Properties["displayName"] -or [string]::IsNullOrWhiteSpace([string]$instance.displayName)) {
             $instance | Add-Member -NotePropertyName "displayName" -NotePropertyValue $DisplayName -Force
         }
@@ -338,18 +366,25 @@ if ($Remove) {
 }
 
 $after = $json | ConvertTo-Json -Depth 32 -Compress
-if ($after -eq $before) {
+if ($after -ceq $before -and ($settingsExists -or $Remove)) {
+    if ($VerifyError) { throw "$VerifyError Aucune instance Oh My Pi active a desactiver." }
     Write-Host "[OK] settings.json deja a jour : aucune reecriture (la sauvegarde .bak existante est conservee)." -ForegroundColor Cyan
     return
 }
 
 $serialized = $json | ConvertTo-Json -Depth 32
 $null = $serialized | ConvertFrom-Json
-if ((Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc -ne $origWriteTime) {
+if ($settingsExists -and (Get-Item -LiteralPath $settingsPath).LastWriteTimeUtc -ne $origWriteTime) {
     throw "settings.json a change pendant l'operation ; modification annulee."
+}
+if (-not $settingsExists -and (Test-Path -LiteralPath $settingsPath)) {
+    throw "settings.json a ete cree pendant l'operation ; modification annulee."
 }
 Write-FileAtomic $settingsPath ($serialized + "`n") "$settingsPath.bak"
 
+if ($VerifyError) {
+    throw "$VerifyError Instance(s) desactivee(s) dans T3 Code par precaution : $($disabled -join ', '). Une fois omp-t3 corrige et ce script relance sans erreur, reactivez-la dans T3 Code."
+}
 if ($Remove) {
     Write-Host "[OK] Instance '$InstanceId' et ses favoris retires de settings.json (sauvegarde : settings.json.bak)." -ForegroundColor Yellow
 } else {

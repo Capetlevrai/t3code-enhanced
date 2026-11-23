@@ -43,9 +43,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\improve-handoff.ps1   # -U
 Then quit T3 Code completely and restart it. The script:
 
 1. Sets the user variable `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP=64000`, the maximum T3 Code accepts (4× the default excerpt). It is still bounded by the free room of the target model, so small models stay safe. Cost: at most ~16k extra input tokens on the turn that switches.
-2. Adds a short rule, between markers, to each installed agent's global instructions: when a handoff omitted items and the request depends on one of them, read the thread with `t3_thread_read` (`view: "messages"`, then `beforePosition`) instead of guessing. Files: `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR`), `~/.codex/AGENTS.md` (or `$CODEX_HOME`), `~/.gemini/GEMINI.md` (T3 Code copies it into its isolated Antigravity profile), `~/.config/opencode/AGENTS.md`, `~/.omp/agent/AGENTS.md`. The rest of each file is left untouched (non-UTF-8 files are skipped); `-Undo` removes only the block. What the script changed (the variable's previous value, the files it created) is recorded in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` restores the previous value and never deletes a file you had before.
+2. Adds a short rule, between markers, to each installed agent's global instructions: when a handoff omitted items and the request depends on one of them, read the thread with `t3_thread_read` (`view: "messages"`, then `beforePosition`) instead of guessing. Files: `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR`), `~/.codex/AGENTS.md` (or `$CODEX_HOME`), `~/.gemini/GEMINI.md` (T3 Code copies it into its isolated Antigravity profile), `~/.config/opencode/AGENTS.md`, `~/.omp/agent/AGENTS.md`. OpenCode and omp read only **one** global file, the first that exists (OpenCode: its `AGENTS.md`, else `~/.claude/CLAUDE.md`; omp: `~/.omp/agent/AGENTS.md`, else `~/.agents/AGENTS.md`, else `~/.agent/AGENTS.md`), so the script writes into the file each of them already reads instead of creating one that would hide your existing rules. The rest of each file is left untouched (non-UTF-8 files are skipped); `-Undo` removes only the block. What the script changed (the variable's previous value, the files it created) is recorded in `%LOCALAPPDATA%\t3code-enhanced\improve-handoff.json`, so `-Undo` restores the previous value and never deletes a file you had before.
 
-3. Installs a `/recap` command (see the [README](../README.md#recap-before-switching-provider)): a native command for Claude Code, omp and OpenCode, and a rule-based fallback for Codex and Antigravity/Gemini.
+3. Installs a `/recap` command (see the [README](../README.md#recap-before-switching-provider)): a native command for Claude Code (`~/.claude/commands`), omp (`~/.omp/agent/commands`; omp ignores `~/.claude/commands` by default) and OpenCode (`~/.config/opencode/commands`), and a rule-based fallback for Codex and Antigravity/Gemini.
 
 Habits that help on top of it:
 
@@ -64,7 +64,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 `
   -Favorites "<provider>/<model>,<provider>/<other-model>"
 ```
 
-Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). Re-running is safe: it keeps your instance's `environment`, colour and other `config` keys, never downgrades omp-t3, and skips the write when nothing changes. Undo with `-Remove`.
+Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3 Code first, or add `-Force` (T3 Code reloads `settings.json` live). If T3 Code is open without `-Force`, the script changes nothing and exits with code 2. Re-running is safe: it keeps your instance's `environment`, colour, other `config` keys and on/off state, never downgrades omp-t3, and skips the write when nothing changes. Undo with `-Remove`.
 
 ### What does not work, and why
 

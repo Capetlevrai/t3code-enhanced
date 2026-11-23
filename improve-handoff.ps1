@@ -14,9 +14,12 @@
          du fichier n'est pas touche.
       3. Installe une commande /recap : avant de changer de fournisseur, elle fait ecrire au modele
          actuel un court recapitulatif de passation. T3 Code transmet en priorite la derniere reponse,
-         donc ce recap passe en entier au modele suivant. Vraie commande pour Claude Code et omp
-         (~/.claude/commands/recap.md) et OpenCode (~/.config/opencode/commands/recap.md) ; pour
-         Codex et Antigravity/Gemini, la consigne globale de l'etape 2 reconnait `/recap`.
+         donc ce recap passe le plus souvent en entier au modele suivant. Vraie commande pour
+         Claude Code (~/.claude/commands), omp (~/.omp/agent/commands) et OpenCode
+         (~/.config/opencode/commands) ; pour Codex et Antigravity/Gemini, la consigne globale de
+         l'etape 2 reconnait `/recap`.
+    Les agents qui ne lisent qu'UN fichier d'instructions global (OpenCode, omp) recoivent la consigne
+    dans le fichier qu'ils lisent deja : le script ne cree pas un fichier qui masquerait l'autre.
     Redemarrez completement T3 Code ensuite (la variable est lue au demarrage).
 .PARAMETER Undo
     Retire la variable, les blocs de consigne et les commandes /recap installees par ce script.
@@ -98,15 +101,43 @@ function Get-HomeDir([string]$Value, [string]$Default) {
 $claudeHome = Get-HomeDir $env:CLAUDE_CONFIG_DIR ".claude"
 $codexHome = Get-HomeDir $env:CODEX_HOME ".codex"
 
+function New-Target([string]$Agent, [string]$AgentDir, [string]$Path) {
+    [pscustomobject]@{ Agent = $Agent; AgentDir = $AgentDir; Path = $Path }
+}
+
 function Get-RuleTargets {
-    @(
-        [pscustomobject]@{ Agent = "Claude Code"; Path = Join-Path $claudeHome "CLAUDE.md" }
-        [pscustomobject]@{ Agent = "Codex"; Path = Join-Path $codexHome "AGENTS.md" }
+    # Some agents load only ONE global instruction file, the first that exists. Creating the preferred
+    # file would hide the one they read today, so write into the file actually in use instead.
+    $u = $env:USERPROFILE
+    $targets = @(
+        New-Target "Claude Code" $claudeHome (Join-Path $claudeHome "CLAUDE.md")
+        New-Target "Codex" $codexHome (Join-Path $codexHome "AGENTS.md")
         # T3 Code copies ~/.gemini/GEMINI.md and AGENTS.md into its isolated Antigravity profile.
-        [pscustomobject]@{ Agent = "Antigravity / Gemini"; Path = Join-Path $env:USERPROFILE ".gemini\GEMINI.md" }
-        [pscustomobject]@{ Agent = "OpenCode"; Path = Join-Path $env:USERPROFILE ".config\opencode\AGENTS.md" }
-        [pscustomobject]@{ Agent = "Oh My Pi (omp)"; Path = Join-Path $env:USERPROFILE ".omp\agent\AGENTS.md" }
+        New-Target "Antigravity / Gemini" (Join-Path $u ".gemini") (Join-Path $u ".gemini\GEMINI.md")
     )
+
+    # OpenCode v2: ~/.config/opencode/AGENTS.md, else ~/.claude/CLAUDE.md (always ~/.claude, not CLAUDE_CONFIG_DIR).
+    $ocDir = Join-Path $u ".config\opencode"
+    $ocOwn = Join-Path $ocDir "AGENTS.md"
+    $ocClaude = Join-Path $u ".claude\CLAUDE.md"
+    $ocReadsClaude = [string]::IsNullOrEmpty($env:OPENCODE_DISABLE_CLAUDE_CODE) -and [string]::IsNullOrEmpty($env:OPENCODE_DISABLE_CLAUDE_CODE_PROMPT)
+    $ocCandidates = @($ocOwn, $ocClaude)
+    $ocPath = if (-not (Test-Path -LiteralPath $ocOwn) -and $ocReadsClaude -and (Test-Path -LiteralPath $ocClaude)) { $ocClaude } else { $ocOwn }
+    $targets += New-Target "OpenCode" $ocDir $ocPath
+
+    # omp keeps one user-level file: ~/.omp/agent/AGENTS.md, else ~/.agents/AGENTS.md, else ~/.agent/AGENTS.md.
+    $ompDir = Join-Path $u ".omp\agent"
+    $ompCandidates = @((Join-Path $ompDir "AGENTS.md"), (Join-Path $u ".agents\AGENTS.md"), (Join-Path $u ".agent\AGENTS.md"))
+    $ompPath = @($ompCandidates | Where-Object { Test-Path -LiteralPath $_ }) | Select-Object -First 1
+    if (-not $ompPath) { $ompPath = $ompCandidates[0] }
+    $targets += New-Target "Oh My Pi (omp)" $ompDir $ompPath
+
+    if ($Undo) {
+        # Undo looks everywhere a block may have been written, whichever file was in use at install time.
+        foreach ($c in $ocCandidates) { $targets += New-Target "OpenCode" $ocDir $c }
+        foreach ($c in $ompCandidates) { $targets += New-Target "Oh My Pi (omp)" $ompDir $c }
+    }
+    return $targets
 }
 
 $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)   # throws on invalid UTF-8
@@ -133,10 +164,9 @@ function Read-State {
     if (Test-Path -LiteralPath $StatePath) {
         $s = [System.IO.File]::ReadAllText($StatePath, $utf8NoBom) | ConvertFrom-Json
         if ($null -eq $s.PSObject.Properties["createdFiles"]) { $s | Add-Member -NotePropertyName createdFiles -NotePropertyValue @() }
-        if ($null -eq $s.PSObject.Properties["claudeDirForOmp"]) { $s | Add-Member -NotePropertyName claudeDirForOmp -NotePropertyValue $false }
         return $s
     }
-    return [pscustomobject]@{ envRecorded = $false; envExisted = $false; envOriginal = $null; createdFiles = @(); claudeDirForOmp = $false }
+    return [pscustomobject]@{ envRecorded = $false; envExisted = $false; envOriginal = $null; createdFiles = @() }
 }
 function Save-State($State) {
     $dir = Split-Path -Parent $StatePath
@@ -190,16 +220,21 @@ if (-not $SkipRules) {
             $state.createdFiles = @($state.createdFiles | Where-Object { $_ -ne $Path }); Save-State $state
         }
     }
+    $processed = @{}
     foreach ($t in Get-RuleTargets) {
-        $dir = Split-Path -Parent $t.Path
-        # ~/.claude created only to give omp its /recap command does not mean Claude Code is installed.
-        $onlyForOmp = ($t.Agent -eq "Claude Code" -and $state.claudeDirForOmp -and $dir -eq (Join-Path $env:USERPROFILE ".claude"))
-        if (-not (Test-Path -LiteralPath $dir) -or $onlyForOmp) {
-            if ($Undo) { Forget-Created $t.Path }
-            Write-Host "[SKIP] $($t.Agent) : $dir absent (agent non installe)." -ForegroundColor DarkGray
+        $key = [System.IO.Path]::GetFullPath($t.Path).ToLowerInvariant()
+        if ($processed.ContainsKey($key)) {
+            if (-not $Undo) { Write-Host "[OK] $($t.Agent) : lit $($t.Path), deja traite ci-dessus." -ForegroundColor Cyan }
             continue
         }
         $exists = Test-Path -LiteralPath $t.Path
+        if (-not (Test-Path -LiteralPath $t.AgentDir) -and -not ($Undo -and $exists)) {
+            if ($Undo) { Forget-Created $t.Path }
+            elseif (-not $processed.ContainsKey("skip:" + $t.Agent)) { Write-Host "[SKIP] $($t.Agent) : $($t.AgentDir) absent (agent non installe)." -ForegroundColor DarkGray }
+            $processed["skip:" + $t.Agent] = $true
+            continue
+        }
+        $processed[$key] = $true
         $text = ""
         $hadBom = $false
         if ($exists) {
@@ -218,16 +253,24 @@ if (-not $SkipRules) {
                 continue
             }
         }
+        # Exactly one start and one end marker, in that order, or none: anything else was edited by hand and
+        # removing "from start to end" could take the user's own text with it.
+        $nStart = ([regex]::Matches($text, [regex]::Escape($Start))).Count
+        $nEnd = ([regex]::Matches($text, [regex]::Escape($End))).Count
+        if (-not (($nStart -eq 0 -and $nEnd -eq 0) -or ($nStart -eq 1 -and $nEnd -eq 1 -and $text.IndexOf($Start) -lt $text.IndexOf($End)))) {
+            Write-Warning "$($t.Agent) : marqueurs t3code-enhanced incomplets ou en double dans $($t.Path) ; fichier laisse intact (corrigez-le a la main)."
+            continue
+        }
         $nl = if ($text.Contains("`r`n")) { "`r`n" } else { "`n" }
         $block = ($Start + "`n" + $Rule.Trim() + "`n" + $End) -replace "`r?`n", $nl
-        $hasBlock = [regex]::IsMatch($text, '(?s)' + $inner)
+        $hasBlock = ($nStart -eq 1)
         $created = @($state.createdFiles) -contains $t.Path
 
         if ($Undo) {
             if (-not $hasBlock) {
                 # Block already gone (removed by hand, file deleted): this file is no longer ours to delete later.
                 Forget-Created $t.Path
-                Write-Host "[OK] $($t.Agent) : aucune consigne a retirer." -ForegroundColor Cyan
+                if ($exists) { Write-Host "[OK] $($t.Agent) : aucune consigne a retirer ($($t.Path))." -ForegroundColor Cyan }
                 continue
             }
             # Remove the block plus the one line break written on each side of it, but never glue two pieces
@@ -263,7 +306,7 @@ if (-not $SkipRules) {
             $new = $text + $nl + $block
         }
 
-        if ($new -eq $text) {
+        if ($new -ceq $text) {
             Write-Host "[OK] $($t.Agent) : consigne deja a jour ($($t.Path))." -ForegroundColor Cyan
             continue
         }
@@ -278,19 +321,14 @@ if (-not $SkipRules) {
 
 # ---------------------------------------------------------------- 3. /recap command files
 if (-not $SkipRecap) {
-    # omp loads Claude Code's user commands from ~/.claude/commands, whether or not Claude Code is installed
-    # and whatever CLAUDE_CONFIG_DIR says. One file serves both when the folders coincide.
-    $ompClaudeCommands = Join-Path $env:USERPROFILE ".claude\commands\recap.md"
-    $claudeCommands = Join-Path $claudeHome "commands\recap.md"
-    $ompInstalled = Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".omp\agent")
-    $recapTargets = @()
-    if ($claudeCommands -eq $ompClaudeCommands) {
-        $recapTargets += [pscustomobject]@{ Agent = "Claude Code + omp"; Installed = ((Test-Path -LiteralPath $claudeHome) -or $ompInstalled); Path = $claudeCommands }
-    } else {
-        $recapTargets += [pscustomobject]@{ Agent = "Claude Code"; Installed = (Test-Path -LiteralPath $claudeHome); Path = $claudeCommands }
-        $recapTargets += [pscustomobject]@{ Agent = "omp"; Installed = $ompInstalled; Path = $ompClaudeCommands }
-    }
-    $recapTargets += [pscustomobject]@{ Agent = "OpenCode"; Installed = (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".config\opencode")); Path = Join-Path $env:USERPROFILE ".config\opencode\commands\recap.md" }
+    # omp reads its own ~/.omp/agent/commands (it ignores ~/.claude/commands unless commands.enableClaudeUser).
+    $ompAgent = Join-Path $env:USERPROFILE ".omp\agent"
+    $openCodeHome = Join-Path $env:USERPROFILE ".config\opencode"
+    $recapTargets = @(
+        [pscustomobject]@{ Agent = "Claude Code"; Installed = (Test-Path -LiteralPath $claudeHome); Path = Join-Path $claudeHome "commands\recap.md" }
+        [pscustomobject]@{ Agent = "Oh My Pi (omp)"; Installed = (Test-Path -LiteralPath $ompAgent); Path = Join-Path $ompAgent "commands\recap.md" }
+        [pscustomobject]@{ Agent = "OpenCode"; Installed = (Test-Path -LiteralPath $openCodeHome); Path = Join-Path $openCodeHome "commands\recap.md" }
+    )
     foreach ($t in $recapTargets) {
         $exists = Test-Path -LiteralPath $t.Path
         $current = if ($exists) { [System.IO.File]::ReadAllText($t.Path, $utf8NoBom) } else { $null }
@@ -306,14 +344,6 @@ if (-not $SkipRecap) {
             } else {
                 Write-Host "[OK] $($t.Agent) : aucune commande /recap a retirer." -ForegroundColor Cyan
             }
-            if ($t.Path -eq $ompClaudeCommands -and $state.claudeDirForOmp) {
-                # ~/.claude was created only for omp: remove it again if nothing else lives there.
-                $claudeRoot = Join-Path $env:USERPROFILE ".claude"
-                foreach ($d in @((Join-Path $claudeRoot "commands"), $claudeRoot)) {
-                    if ((Test-Path -LiteralPath $d) -and @(Get-ChildItem -LiteralPath $d -Force).Count -eq 0) { Remove-Item -LiteralPath $d -Force }
-                }
-                $state.claudeDirForOmp = $false; Save-State $state
-            }
             continue
         }
         if (-not $t.Installed) {
@@ -321,12 +351,9 @@ if (-not $SkipRecap) {
             continue
         }
         $content = $RecapCommand -replace "`r?`n", "`n"
-        if ($ours -and $current -eq $content) {
+        if ($ours -and $current -ceq $content) {
             Write-Host "[OK] $($t.Agent) : commande /recap deja a jour ($($t.Path))." -ForegroundColor Cyan
             continue
-        }
-        if ($t.Path -eq $ompClaudeCommands -and -not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".claude"))) {
-            $state.claudeDirForOmp = $true; Save-State $state
         }
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $t.Path) | Out-Null
         Write-FileAtomic $t.Path $content -NoBackup
