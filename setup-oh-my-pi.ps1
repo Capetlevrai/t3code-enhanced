@@ -56,7 +56,7 @@ $MaxJsonDepth = 30   # ConvertTo-Json -Depth 32 below; deeper settings would be 
 $PatchOld = "this.issuesEnabled = options.issuesEnabled !== false;"
 $PatchNew = "this.issuesEnabled = options.issuesEnabled === true || (options.issuesEnabled !== false && process.env.OMPT3_FILE_ISSUES === '1');"
 
-if ($InstanceId -notmatch '^[A-Za-z][A-Za-z0-9_-]*$') { throw "InstanceId invalide : $InstanceId" }
+if ($InstanceId -notmatch '^[A-Za-z][A-Za-z0-9_-]{0,63}$') { throw "InstanceId invalide (lettre puis lettres, chiffres, _ ou -, 64 caracteres max) : $InstanceId" }
 
 # `powershell -File` passes "a","b" as ONE string: split on commas and strip quotes.
 foreach ($a in $MoreFavorites) {
@@ -270,6 +270,8 @@ if (-not $hasInstances -and -not $Remove) {
     $hasInstances = $true
 }
 $existing = if ($hasInstances) { $json.providerInstances.PSObject.Properties[$InstanceId] } else { $null }
+# PowerShell finds "OhMyPi" for "ohmypi"; T3 keys are case-sensitive, so reuse the existing spelling.
+if ($null -ne $existing) { $InstanceId = $existing.Name }
 $favs = @()
 if ($null -ne $json.PSObject.Properties["favorites"]) { $favs = @($json.favorites | Where-Object { $null -ne $_ }) }
 

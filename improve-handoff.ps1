@@ -133,9 +133,10 @@ function Read-State {
     if (Test-Path -LiteralPath $StatePath) {
         $s = [System.IO.File]::ReadAllText($StatePath, $utf8NoBom) | ConvertFrom-Json
         if ($null -eq $s.PSObject.Properties["createdFiles"]) { $s | Add-Member -NotePropertyName createdFiles -NotePropertyValue @() }
+        if ($null -eq $s.PSObject.Properties["claudeDirForOmp"]) { $s | Add-Member -NotePropertyName claudeDirForOmp -NotePropertyValue $false }
         return $s
     }
-    return [pscustomobject]@{ envRecorded = $false; envExisted = $false; envOriginal = $null; createdFiles = @() }
+    return [pscustomobject]@{ envRecorded = $false; envExisted = $false; envOriginal = $null; createdFiles = @(); claudeDirForOmp = $false }
 }
 function Save-State($State) {
     $dir = Split-Path -Parent $StatePath
@@ -167,10 +168,10 @@ if (-not $SkipEnv) {
     } elseif ($current -eq $EnvValue) {
         Write-Host "[OK] $EnvName deja a $EnvValue." -ForegroundColor Cyan
     } else {
-        if (-not $state.envRecorded) {
-            $state.envRecorded = $true; $state.envExisted = ($null -ne $current); $state.envOriginal = $current
-            Save-State $state
-        }
+        # The current value is what -Undo must give back, even if an older one was recorded: the user set
+        # it after the previous install.
+        $state.envRecorded = $true; $state.envExisted = ($null -ne $current); $state.envOriginal = $current
+        Save-State $state
         [Environment]::SetEnvironmentVariable($EnvName, $EnvValue, "User")
         $was = if ($null -eq $current) { "defaut 16000" } else { $current }
         Write-Host "[OK] $EnvName = $EnvValue (avant : $was)." -ForegroundColor Green
@@ -184,8 +185,6 @@ if (-not $SkipEnv) {
 # ---------------------------------------------------------------- 2. agent rules
 if (-not $SkipRules) {
     $inner = [regex]::Escape($Start) + '.*?' + [regex]::Escape($End)
-    # The block is always written as <newline><block>[<newline>], so removing exactly that restores the file.
-    $whole = '(?s)(?:\r?\n|^)' + $inner + '(?:\r?\n)?'
     function Forget-Created([string]$Path) {
         if (@($state.createdFiles) -contains $Path) {
             $state.createdFiles = @($state.createdFiles | Where-Object { $_ -ne $Path }); Save-State $state
@@ -193,7 +192,9 @@ if (-not $SkipRules) {
     }
     foreach ($t in Get-RuleTargets) {
         $dir = Split-Path -Parent $t.Path
-        if (-not (Test-Path -LiteralPath $dir)) {
+        # ~/.claude created only to give omp its /recap command does not mean Claude Code is installed.
+        $onlyForOmp = ($t.Agent -eq "Claude Code" -and $state.claudeDirForOmp -and $dir -eq (Join-Path $env:USERPROFILE ".claude"))
+        if (-not (Test-Path -LiteralPath $dir) -or $onlyForOmp) {
             if ($Undo) { Forget-Created $t.Path }
             Write-Host "[SKIP] $($t.Agent) : $dir absent (agent non installe)." -ForegroundColor DarkGray
             continue
@@ -229,10 +230,21 @@ if (-not $SkipRules) {
                 Write-Host "[OK] $($t.Agent) : aucune consigne a retirer." -ForegroundColor Cyan
                 continue
             }
-            # Block first in the file (file created by this script, user text added below): also drop the
-            # blank line that separated them.
-            $atStart = '(?s)^' + $inner + '(?:\r?\n){1,2}'
-            $new = if ([regex]::IsMatch($text, $atStart) -and $created) { ([regex]$atStart).Replace($text, "", 1) } else { ([regex]$whole).Replace($text, "", 1) }
+            # Remove the block plus the one line break written on each side of it, but never glue two pieces
+            # of the user's text together.
+            $m = ([regex]('(?s)' + $inner)).Match($text)
+            $before = $text.Substring(0, $m.Index)
+            $after = $text.Substring($m.Index + $m.Length)
+            $before = $before -replace '\r?\n\z', ''
+            $after = $after -replace '\A\r?\n', ''
+            if ($before.Length -eq 0 -and $created) {
+                # File created by this script, user text added below: also drop the blank line between them.
+                $after = $after -replace '\A\r?\n', ''
+            }
+            if ($before.Length -gt 0 -and $after.Length -gt 0 -and -not $before.EndsWith("`n") -and -not $after.StartsWith("`n") -and -not $after.StartsWith("`r`n")) {
+                $before += $nl
+            }
+            $new = $before + $after
             if ($created -and $new.Trim().Length -eq 0) {
                 Remove-Item -LiteralPath $t.Path -Force
                 Forget-Created $t.Path
@@ -294,6 +306,14 @@ if (-not $SkipRecap) {
             } else {
                 Write-Host "[OK] $($t.Agent) : aucune commande /recap a retirer." -ForegroundColor Cyan
             }
+            if ($t.Path -eq $ompClaudeCommands -and $state.claudeDirForOmp) {
+                # ~/.claude was created only for omp: remove it again if nothing else lives there.
+                $claudeRoot = Join-Path $env:USERPROFILE ".claude"
+                foreach ($d in @((Join-Path $claudeRoot "commands"), $claudeRoot)) {
+                    if ((Test-Path -LiteralPath $d) -and @(Get-ChildItem -LiteralPath $d -Force).Count -eq 0) { Remove-Item -LiteralPath $d -Force }
+                }
+                $state.claudeDirForOmp = $false; Save-State $state
+            }
             continue
         }
         if (-not $t.Installed) {
@@ -304,6 +324,9 @@ if (-not $SkipRecap) {
         if ($ours -and $current -eq $content) {
             Write-Host "[OK] $($t.Agent) : commande /recap deja a jour ($($t.Path))." -ForegroundColor Cyan
             continue
+        }
+        if ($t.Path -eq $ompClaudeCommands -and -not (Test-Path -LiteralPath (Join-Path $env:USERPROFILE ".claude"))) {
+            $state.claudeDirForOmp = $true; Save-State $state
         }
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $t.Path) | Out-Null
         Write-FileAtomic $t.Path $content -NoBackup

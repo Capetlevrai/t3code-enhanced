@@ -94,12 +94,14 @@ Take the model ids from `omp models ls <pattern>` (e.g. `zai/glm-5.3`). Close T3
 4. **omp-t3 defaults change omp's behavior.** It removes omp's native `task` subagents and tells the model to delegate through T3's `delegate_task`. Delegated models must be on a built-in allowlist (`glm-5.3-flash`, `gemini-3.8-flash`, `deepseek-v4.1-flash` only) and off a denylist (`gpt-*sol*`, `*opus*`, `glm-5.3`, `glm-5.3:*`). To restore stock omp, add to the instance in `settings.json`:
 
    ```json
-   "environment": {
-     "OMPT3_DELEGATE_TASKS": "0",
-     "OMPT3_SUBAGENT_ALLOWED_MODELS": "",
-     "OMPT3_SUBAGENT_DISALLOWED_MODELS": ""
-   }
+   "environment": [
+     { "name": "OMPT3_DELEGATE_TASKS", "value": "0" },
+     { "name": "OMPT3_SUBAGENT_ALLOWED_MODELS", "value": "" },
+     { "name": "OMPT3_SUBAGENT_DISALLOWED_MODELS", "value": "" }
+   ]
    ```
+
+   T3 Code expects a list of `{ "name", "value" }` entries here, not an object.
 
    The two lists must be truly empty (blank in T3 Code's settings UI). Typing `""` into the UI field makes `""` a pattern that matches no model, which blocks every delegation.
 
