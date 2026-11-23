@@ -33,12 +33,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\add-defender-exclusions.ps
 [`docs/PROVIDERS.md`](docs/PROVIDERS.md) covers moving OpenCode to v2, what a provider switch (handoff) really passes to the next model, and adding **Oh My Pi** through the [omp-t3](https://github.com/hashangit/omp-t3) shim:
 
 ```powershell
-# Pass 4x more history when switching provider mid-thread, and teach every agent to re-read what was left out
+# Pass 4x more history when switching provider mid-thread, teach every agent to re-read
+# what was left out, and install the /recap command
 powershell -NoProfile -ExecutionPolicy Bypass -File .\improve-handoff.ps1
 
 # Add Oh My Pi as a T3 Code provider
 powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-oh-my-pi.ps1 -Favorites "<provider>/<model>"
 ```
+
+### `/recap` before switching provider
+
+When a thread switches provider, T3 Code hands the next model only an excerpt of the thread, and it always keeps the **last answer** first. `/recap` makes that last answer a compact hand-off note, so it reaches the next model intact.
+
+1. Type `/recap` in the current conversation (optionally `/recap <point to focus on>`).
+2. The model replies with a recap of at most 25 lines and no logs: goal, decisions, what's done (files, commits, tests), next steps, open questions, where to find details. It makes no tool calls.
+3. Switch provider and carry on.
+
+| Agent | How `/recap` works | Tested |
+| --- | --- | --- |
+| Claude Code | Command `~/.claude/commands/recap.md` (shows in the `/` menu) | ✅ |
+| Oh My Pi (omp) | Same file: omp loads Claude Code's user commands | ✅ |
+| OpenCode v2 | Command `~/.config/opencode/commands/recap.md` | ✅ |
+| Codex | Global rule in `~/.codex/AGENTS.md` recognises `/recap` | ✅ |
+| Antigravity / Gemini | Global rule in `~/.gemini/GEMINI.md` (T3 Code copies it into its Antigravity profile) | ✅ |
+
+Use it on long threads. On short ones, or when switching back to a provider that already took part (it keeps its own memory), it is not needed. `/compact` is **not** a substitute: a compaction summary is not among the items T3 Code passes on a handoff.
+
+`improve-handoff.ps1` never overwrites a `recap.md` it did not create, and `-Undo` removes only what it installed.
 
 ## How It Works
 
@@ -69,5 +90,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\remove-defender-exclusions
 - [`optimize-t3code.ps1`](optimize-t3code.ps1) — Disables provider update checks, cleans rotated logs, optimizes SQLite, optional autostart
 - [`add-defender-exclusions.ps1`](add-defender-exclusions.ps1) / [`remove-defender-exclusions.ps1`](remove-defender-exclusions.ps1) — Windows Defender exclusions
 - [`setup-oh-my-pi.ps1`](setup-oh-my-pi.ps1) — Oh My Pi provider via omp-t3 (Bun/omp checks, GitHub-issue opt-in patch, `settings.json` + favorites)
-- [`improve-handoff.ps1`](improve-handoff.ps1) — Max handoff excerpt (`T3CODE_CONTEXT_HANDOFF_TOKEN_CAP=64000`) + re-read rule in each agent's global instructions (`-Undo`)
+- [`improve-handoff.ps1`](improve-handoff.ps1) — Max handoff excerpt (`T3CODE_CONTEXT_HANDOFF_TOKEN_CAP=64000`), re-read rule in each agent's global instructions, `/recap` command (`-Undo`)
 - [`docs/PROVIDERS.md`](docs/PROVIDERS.md) — OpenCode v2, handoff, Oh My Pi: traps and fixes

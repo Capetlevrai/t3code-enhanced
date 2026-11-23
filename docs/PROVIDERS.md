@@ -45,9 +45,11 @@ Then quit T3 Code completely and restart it. The script:
 1. Sets the user variable `T3CODE_CONTEXT_HANDOFF_TOKEN_CAP=64000`, the maximum T3 Code accepts (4× the default excerpt). It is still bounded by the free room of the target model, so small models stay safe. Cost: at most ~16k extra input tokens on the turn that switches.
 2. Adds a short rule, between markers, to each installed agent's global instructions: when a handoff omitted items and the request depends on one of them, read the thread with `t3_thread_read` (`view: "messages"`, then `beforePosition`) instead of guessing. Files: `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` (or `$CODEX_HOME`), `~/.gemini/GEMINI.md` (T3 Code copies it into its isolated Antigravity profile), `~/.config/opencode/AGENTS.md`, `~/.omp/agent/AGENTS.md`. The rest of each file is left untouched; `-Undo` removes only the block.
 
+3. Installs a `/recap` command (see the [README](../README.md#recap-before-switching-provider)): a native command for Claude Code, omp and OpenCode, and a rule-based fallback for Codex and Antigravity/Gemini.
+
 Habits that help on top of it:
 
-- **Before switching**, ask the current model for a short recap (decisions, results, open point). The last assistant message is selected first, so a compact recap almost always makes it through whole.
+- **Before switching**, type `/recap`. The last assistant message is selected first, so a compact recap almost always makes it through whole. Do not rely on `/compact` instead: compaction summaries are not part of what a handoff sends (`historicalMessage` keeps user/assistant messages, commands, file changes, errors and plans only).
 - **When switching to resume a precise point**, quote a distinctive sentence from the answer you mean. Your new message is never cut.
 - **Keep noisy work out of the main thread:** delegate big builds or log dumps to a sub-agent so their output does not eat the handoff budget.
 
